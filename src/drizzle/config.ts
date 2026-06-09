@@ -1,0 +1,218 @@
+import { writeFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import type { AnyTableDef } from '../store';
+import { createSettingsDef } from '../store/settings';
+import {
+  buildColumn,
+  type ColumnAdapter,
+  classifyZodColumn,
+  normalizePrimaryKey,
+  resolveIndexName,
+  unwrapZodType,
+} from './utils';
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+export type ConfigOptions = {
+  /** Path to the generated schema file. Default: `'./schema.ts'` */
+  schema?: string;
+  /** Migrations output directory. Default: `'./migrations'` */
+  out?: string;
+  /** Database dialect. Default: `'sqlite'` */
+  dialect?: 'sqlite' | 'postgresql' | 'mysql';
+  /** Database driver. Default: `'sqlite'` */
+  driver?: 'sqlite' | 'durable-sqlite' | 'expo';
+};
+
+export type SchemaOptions = {
+  /**
+   * Whether to include the built-in `__store_settings` table in the generated
+   * schema. Default: `true`. Set to `false` if you manage the settings table
+   * yourself or want to opt out entirely.
+   */
+  settings?: boolean;
+};
+
+export type GenerateOptions = ConfigOptions &
+  SchemaOptions & {
+    /** Where to write the schema file. Default: `'./schema.ts'` */
+    schemaOut?: string;
+    /** Where to write the drizzle config file. Default: `'./drizzle.config.ts'` */
+    configOut?: string;
+  };
+
+const sq = (s: string) => `'${s}'`;
+
+// ─── Zod → column code string ─────────────────────────────────────────────────
+
+const codeAdapter: ColumnAdapter<string> = {
+  text: (name) => `text('${name}')`,
+  integer: (name) => `integer('${name}')`,
+  real: (name) => `real('${name}')`,
+  integerBoolean: (name) => `integer('${name}', { mode: 'boolean' })`,
+  integerTimestamp: (name) => `integer('${name}', { mode: 'timestamp_ms' })`,
+  jsonText: (name) => `text('${name}', { mode: 'json' })`,
+  notNull: (col) => `${col}.notNull()`,
+  withDefault: (col, value) => `${col}.default(${JSON.stringify(value)})`,
+};
+
+function zodToColumnCode(fieldName: string, zodType: unknown): string {
+  return buildColumn(fieldName, zodType, codeAdapter);
+}
+
+// ─── generateSchemaCode ───────────────────────────────────────────────────────
+
+/**
+ * Generates the content of a Drizzle schema `.ts` file from a `defineStore` defs object.
+ * The returned string can be written directly to disk (e.g. `./src/schema.ts`).
+ */
+export function generateSchemaCode(
+  defs: Record<string, AnyTableDef>,
+  options: SchemaOptions = {},
+): string {
+  const imports = new Set<string>(['sqliteTable', 'primaryKey']);
+  const tables: string[] = [];
+
+  const includeSettings = options.settings !== false;
+  /* v8 ignore next -- nested ternary; all branches tested but V8 can't track them */
+  const allDefs = includeSettings
+    ? 'settings' in defs
+      ? defs
+      : { ...defs, settings: createSettingsDef() }
+    : Object.fromEntries(
+        Object.entries(defs).filter(([k]) => k !== 'settings'),
+      );
+
+  for (const [key, def] of Object.entries(allDefs)) {
+    // Columns
+    const cols: string[] = [];
+    for (const [field, zodType] of Object.entries(def.schema.shape)) {
+      const code = zodToColumnCode(field, zodType);
+      const kind = classifyZodColumn(field, unwrapZodType(zodType).type);
+      if (kind.tag === 'text' || kind.tag === 'json_text') imports.add('text');
+      else if (kind.tag === 'real') imports.add('real');
+      else imports.add('integer');
+      cols.push(`  ${field}: ${code}`);
+    }
+
+    // Primary key
+    const pkFields = normalizePrimaryKey(def.primaryKey);
+    const extras: string[] = [
+      `primaryKey({ columns: [${pkFields.map((f) => `t.${f}`).join(', ')}] })`,
+    ];
+
+    // Indexes
+    for (const idx of def.indexes ?? []) {
+      for (const col of idx.columns) {
+        const zodType = def.schema.shape[col as string];
+        const kind = classifyZodColumn(
+          col as string,
+          unwrapZodType(zodType).type,
+        );
+        if (kind.tag === 'json_text') {
+          throw new Error(
+            `cannot index JSON field "${col as string}" — use a scalar field for indexes`,
+          );
+        }
+      }
+      const idxCols = [...idx.columns] as string[];
+      const name = resolveIndexName(def.tableName, idx);
+      if (idx.unique) {
+        imports.add('unique');
+        extras.push(
+          `unique(${sq(name)}).on(${idxCols.map((f) => `t.${f}`).join(', ')})`,
+        );
+      } else {
+        imports.add('index');
+        extras.push(
+          `index(${sq(name)}).on(${idxCols.map((f) => `t.${f}`).join(', ')})`,
+        );
+      }
+    }
+
+    const extrasBlock = `(t) => [\n    ${extras.join(',\n    ')},\n  ]`;
+    tables.push(
+      `export const ${key} = sqliteTable(${sq(def.tableName)}, {\n${cols.join(',\n')},\n}, ${extrasBlock});`,
+    );
+  }
+
+  const importLine = `import { ${[...imports].sort().join(', ')} } from 'drizzle-orm/sqlite-core';`;
+  return (
+    [
+      '// Auto-generated by @inntend/store — do not edit manually',
+      importLine,
+      '',
+      ...tables,
+    ].join('\n') + '\n'
+  );
+}
+
+// ─── generateConfigCode ───────────────────────────────────────────────────────
+
+/**
+ * Generates the content of a `drizzle.config.ts` file.
+ */
+export function generateConfigCode(options: ConfigOptions = {}): string {
+  const schema = options.schema ?? './schema.ts';
+  const out = options.out ?? './migrations';
+  const dialect = options.dialect ?? 'sqlite';
+  const driver = options.driver ?? 'sqlite';
+
+  return [
+    '// Auto-generated by @inntend/store — do not edit manually',
+    "import { defineConfig } from 'drizzle-kit';",
+    '',
+    'export default defineConfig({',
+    `  schema: ${sq(schema)},`,
+    `  out: ${sq(out)},`,
+    `  dialect: ${sq(dialect)},`,
+    `  driver: ${sq(driver)},`,
+    '});',
+    '',
+  ].join('\n');
+}
+
+// ─── generateDrizzleConfig ────────────────────────────────────────────────────
+
+/**
+ * Generates and writes both `schema.ts` and `drizzle.config.ts` to disk.
+ *
+ * Call this from a script in your project root:
+ * ```ts
+ * // generate-drizzle.ts
+ * import { generateDrizzleConfig } from '@inntend/store/config';
+ * import { defs } from './src/defs';
+ *
+ * generateDrizzleConfig(defs, {
+ *   schemaOut: './src/schema.ts',
+ *   configOut: './drizzle.config.ts',
+ *   driver: 'durable-sqlite',
+ * });
+ * ```
+ *
+ * Add to `package.json`: `"db:generate": "tsx generate-drizzle.ts"`
+ */
+export function generateDrizzleConfig(
+  defs: Record<string, AnyTableDef>,
+  options: GenerateOptions = {},
+): void {
+  const schemaOut = resolve(options.schemaOut ?? './schema.ts');
+  const configOut = resolve(options.configOut ?? './drizzle.config.ts');
+
+  writeFileSync(
+    schemaOut,
+    generateSchemaCode(defs, { settings: options.settings }),
+    'utf8',
+  );
+  console.log(`Generated ${schemaOut}`);
+
+  writeFileSync(
+    configOut,
+    generateConfigCode({
+      ...options,
+      schema: options.schemaOut ?? options.schema,
+    }),
+    'utf8',
+  );
+  console.log(`Generated ${configOut}`);
+}

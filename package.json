@@ -1,0 +1,80 @@
+{
+  "name": "@inntend/store",
+  "version": "0.0.0",
+  "description": "Store management library for TypeScript applications",
+  "type": "module",
+  "engines": {
+    "npm": "=10.x",
+    "node": "=24.x"
+  },
+  "packageManager": "pnpm@11.5.0",
+  "exports": {
+    ".": {
+      "import": "./src/store/index.ts",
+      "default": "./src/store/index.ts"
+    },
+    "./dexie": {
+      "import": "./src/dexie/index.ts",
+      "default": "./src/dexie/index.ts"
+    },
+    "./drizzle": {
+      "import": "./src/drizzle/index.ts",
+      "default": "./src/drizzle/index.ts"
+    },
+    "./drizzle/config": {
+      "import": "./src/drizzle/config.ts",
+      "default": "./src/drizzle/config.ts"
+    },
+    "./react": {
+      "import": "./src/react/index.ts",
+      "default": "./src/react/index.ts"
+    }
+  },
+  "scripts": {
+    "validate": "pnpm run check && pnpm run build:check && pnpm run test:coverage",
+    "check": "biome check --write",
+    "check:ci": "biome ci",
+    "build:check": "tsc --noEmit",
+    "build": "tsc",
+    "test:coverage": "vitest run --coverage",
+    "test": "vitest"
+  },
+  "dependencies": {
+    "@scure/bip39": "^2.2.0",
+    "uuid": "^14.0.0"
+  },
+  "peerDependencies": {
+    "dexie": ">=4",
+    "drizzle-orm": ">=0",
+    "react": ">=19",
+    "zod": ">=4"
+  },
+  "peerDependenciesMeta": {
+    "dexie": {
+      "optional": true
+    },
+    "drizzle-orm": {
+      "optional": true
+    },
+    "react": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.4.16",
+    "@testing-library/react": "^16.3.2",
+    "@types/node": "^25.9.1",
+    "@types/react": "^19.2.15",
+    "@types/react-dom": "^19.2.3",
+    "@vitest/coverage-v8": "^4.1.8",
+    "dexie": "^4.4.3",
+    "drizzle-orm": "^0.45.2",
+    "fake-indexeddb": "^6.2.5",
+    "jsdom": "^29.1.1",
+    "react": "^19.2.6",
+    "react-dom": "^19.2.6",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.8",
+    "zod": "^4.4.3"
+  }
+}

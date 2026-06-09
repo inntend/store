@@ -1,0 +1,26 @@
+name: "Publish to GitHub Packages"
+
+on:
+  push:
+    # Trigger on any tag
+    tags: ["*"]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: package.json
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+          registry-url: https://registry.npmjs.org
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm version ${{ github.ref_name }} --no-git-tag-version
+      - run: pnpm run build
+      - run: pnpm publish --access public --no-git-checks --provenance
