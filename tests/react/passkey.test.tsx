@@ -422,6 +422,42 @@ describe('usePasskeyRotation', () => {
     expect(result.current.state.status).toBe('idle');
   });
 
+  it('tryPhraseRecovery sets phraseError when no recovery keys remain in store', async () => {
+    const { secret, accountStoreKey } = await seedAccountKey();
+    await seedRecoveryKey(accountStoreKey, secret);
+    decryptMock.mockRejectedValueOnce(new Error('bad cred'));
+
+    const { result } = renderHook(
+      () =>
+        usePasskeyRotation({
+          getOldSecret: async () => new Uint8Array(32).fill(1),
+          getNewSecret: async () => new Uint8Array(32).fill(3),
+          deletePasskey: async () => {},
+          createPasskey: async () => {},
+          onDone: async () => {},
+        }),
+      { wrapper },
+    );
+
+    await act(() => result.current.start('pk'));
+    expect(result.current.state.status).toBe('phrase-needed');
+
+    // Remove recovery keys so the next tryPhraseRecovery finds none
+    await cs.store.table.key.deleteMany({
+      where: { type: { $eq: 'recovery' } },
+    });
+
+    await act(() =>
+      result.current.tryPhraseRecovery(
+        'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
+      ),
+    );
+
+    expect(result.current.phraseError).toBe(
+      'Invalid recovery phrase. Check each word and try again.',
+    );
+  });
+
   it('start resets phraseError and pending secret from previous run', async () => {
     const { secret, accountStoreKey } = await seedAccountKey();
     await seedRecoveryKey(accountStoreKey, secret);
@@ -446,5 +482,141 @@ describe('usePasskeyRotation', () => {
     // Second run: succeeds, clearing state
     await act(() => result.current.start('pk'));
     expect(result.current.phraseError).toBe('');
+  });
+});
+
+// ─── usePasskeyRotation — startLost ──────────────────────────────────────────
+
+describe('usePasskeyRotation — startLost', () => {
+  const PHRASE =
+    'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
+
+  it('completes successfully: state becomes done, callbacks fired', async () => {
+    const { secret, accountStoreKey } = await seedAccountKey();
+    await seedRecoveryKey(accountStoreKey, secret);
+
+    const deletePasskey = vi.fn(async (_id: string) => {});
+    const createPasskey = vi.fn(async () => {});
+    const onDone = vi.fn(async () => {});
+
+    const { result } = renderHook(
+      () =>
+        usePasskeyRotation({
+          getOldSecret: async () => new Uint8Array(32).fill(1),
+          getNewSecret: async () => new Uint8Array(32).fill(3),
+          deletePasskey,
+          createPasskey,
+          onDone,
+        }),
+      { wrapper },
+    );
+
+    await act(() => result.current.startLost('old-pk', PHRASE));
+
+    expect(result.current.state.status).toBe('done');
+    expect(deletePasskey).toHaveBeenCalledWith('old-pk');
+    expect(createPasskey).toHaveBeenCalledOnce();
+    expect(onDone).toHaveBeenCalledOnce();
+  });
+
+  it('sets error state when no recovery keys exist', async () => {
+    const { result } = renderHook(
+      () =>
+        usePasskeyRotation({
+          getOldSecret: async () => new Uint8Array(32).fill(1),
+          getNewSecret: async () => new Uint8Array(32).fill(3),
+          deletePasskey: async () => {},
+          createPasskey: async () => {},
+          onDone: async () => {},
+        }),
+      { wrapper },
+    );
+
+    await act(() => result.current.startLost('pk', PHRASE));
+
+    expect(result.current.state.status).toBe('error');
+    expect(
+      (result.current.state as { status: 'error'; error: string }).error,
+    ).toContain('No recovery phrase');
+  });
+
+  it('calls sync before onDone', async () => {
+    const { secret, accountStoreKey } = await seedAccountKey();
+    await seedRecoveryKey(accountStoreKey, secret);
+
+    const callOrder: string[] = [];
+    const sync = vi.fn(async () => {
+      callOrder.push('sync');
+    });
+    const onDone = vi.fn(async () => {
+      callOrder.push('onDone');
+    });
+
+    const { result } = renderHook(
+      () =>
+        usePasskeyRotation({
+          getOldSecret: async () => new Uint8Array(32).fill(1),
+          getNewSecret: async () => new Uint8Array(32).fill(3),
+          deletePasskey: async () => {},
+          createPasskey: async () => {},
+          onDone,
+          sync,
+        }),
+      { wrapper },
+    );
+
+    await act(() => result.current.startLost('pk', PHRASE));
+    expect(callOrder).toEqual(['sync', 'onDone']);
+  });
+
+  it('preserves the account key id', async () => {
+    const { secret, accountStoreKey } = await seedAccountKey();
+    await seedRecoveryKey(accountStoreKey, secret);
+
+    const { result } = renderHook(
+      () =>
+        usePasskeyRotation({
+          getOldSecret: async () => new Uint8Array(32).fill(1),
+          getNewSecret: async () => new Uint8Array(32).fill(3),
+          deletePasskey: async () => {},
+          createPasskey: async () => {},
+          onDone: async () => {},
+        }),
+      { wrapper },
+    );
+
+    await act(() => result.current.startLost('pk', PHRASE));
+
+    const keys = await cs.store.table.key.findMany({
+      where: { type: { $eq: 'account' } },
+    });
+    expect(keys).toHaveLength(1);
+    expect(keys[0]!.id).toBe(accountStoreKey.id);
+  });
+
+  it('sets error state when getNewSecret throws', async () => {
+    const { secret, accountStoreKey } = await seedAccountKey();
+    await seedRecoveryKey(accountStoreKey, secret);
+
+    const { result } = renderHook(
+      () =>
+        usePasskeyRotation({
+          getOldSecret: async () => new Uint8Array(32).fill(1),
+          getNewSecret: async () => {
+            throw new Error('device error');
+          },
+          deletePasskey: async () => {},
+          createPasskey: async () => {},
+          onDone: async () => {},
+        }),
+      { wrapper },
+    );
+
+    await act(() => result.current.startLost('pk', PHRASE));
+
+    expect(result.current.state.status).toBe('error');
+    expect(
+      (result.current.state as { status: 'error'; error: string }).error,
+    ).toBe('device error');
   });
 });

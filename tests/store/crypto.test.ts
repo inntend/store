@@ -14,6 +14,7 @@ import {
   type KeyConfig,
   toB64,
 } from '../../src/store/crypto';
+import { baseIndexes } from '../../src/store/schemas';
 
 // ─── Mock CryptoManager ───────────────────────────────────────────────────────
 //
@@ -119,6 +120,57 @@ const plainDefs = defineStore({
     tableName: 'users',
     schema: UserSchema,
     primaryKey: 'id',
+  }),
+});
+
+// defs with ev in the schema and indexed — required for createCryptoStore.reencrypt
+// which queries rawTable.findMany({ where: { ev: { $lt: ... } } })
+const EvItemSchema = z.object({
+  id: z.string(),
+  mv: z.number().int().default(0),
+  ev: z.number().int().default(0),
+  createdAt: z.coerce.date().default(() => new Date()),
+  updatedAt: z.coerce.date().default(() => new Date()),
+  deleted: z.boolean().default(false),
+  syncedAt: z.coerce.date().optional(),
+  name: z.string(),
+  secret: CryptoPayload.optional(),
+});
+const evItemDefs = defineStore({
+  items: defineTable({
+    tableName: 'items',
+    schema: EvItemSchema,
+    primaryKey: 'id',
+    encryptedFields: ['secret'],
+    decryptedSchema: EvItemSchema.extend({ secret: z.string().optional() }),
+    indexes: [...baseIndexes],
+  }),
+});
+
+// defs with ev AND computed indexes — for revalidateIds stale-index branch
+const EvEmailStorageSchema = z.object({
+  id: z.string(),
+  mv: z.number().int().default(0),
+  ev: z.number().int().default(0),
+  createdAt: z.coerce.date().default(() => new Date()),
+  updatedAt: z.coerce.date().default(() => new Date()),
+  deleted: z.boolean().default(false),
+  syncedAt: z.coerce.date().optional(),
+  email: CryptoPayload.optional(), // stored encrypted
+  emailIdx: z.string().optional().nullable(),
+});
+const EvEmailDecSchema = EvEmailStorageSchema.extend({
+  email: z.string().optional(),
+});
+const evEmailDefs = defineStore({
+  contacts: defineTable({
+    tableName: 'contacts',
+    schema: EvEmailStorageSchema,
+    primaryKey: 'id',
+    encryptedFields: ['email'],
+    decryptedSchema: EvEmailDecSchema,
+    computedIndexes: [{ sourceField: 'email', indexField: 'emailIdx' }],
+    indexes: [...baseIndexes],
   }),
 });
 
@@ -403,6 +455,12 @@ describe('createCryptoStore — field encryption', () => {
     expect(inserted.mv).toBe(1);
     const found = await store.table.users.find('1');
     expect(found?.mv).toBe(1);
+  });
+
+  it('update throws when the record does not exist', async () => {
+    await expect(
+      store.table.users.update('ghost', { name: 'x', age: 0 }),
+    ).rejects.toThrow('"ghost" not found');
   });
 });
 
@@ -778,6 +836,40 @@ describe('cryptoManager', () => {
       ),
     ).rejects.toThrow('Current secret is incorrect');
   });
+
+  it('updateKey sort comparator runs when multiple existing keys have different ev values', async () => {
+    const mgr = cryptoManager(roundTripManager);
+    const { storeKeys } = await mgr.updateKey(
+      'account',
+      new TextEncoder().encode('pass'),
+    );
+    const base = storeKeys[0]!;
+    const key1: Key = {
+      ...base,
+      mv: 0,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      deleted: false,
+      ev: 0,
+    } as Key;
+    const key2: Key = {
+      ...base,
+      mv: 0,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      deleted: false,
+      ev: 1,
+      id: 'key2-sort-test',
+    } as Key;
+    // 2 existing keys → sort comparator (line 728) is invoked
+    const { storeKeys: rotated } = await mgr.updateKey(
+      'account',
+      new TextEncoder().encode('new-pass'),
+      [key1, key2],
+      new TextEncoder().encode('pass'),
+    );
+    expect(rotated[0]!.type).toBe('account');
+  });
 });
 
 // ─── cryptoManager — createMasterKey ─────────────────────────────────────────
@@ -909,6 +1001,21 @@ describe('cryptoManager — createMasterKey', () => {
         undefined,
       ),
     ).rejects.toThrow('Current secret is required');
+  });
+
+  it('updateMasterKey sort comparator runs when multiple existing keys have different ev values', async () => {
+    const mgr = cryptoManager(roundTripManager);
+    const first = await mgr.updateMasterKey(new TextEncoder().encode('pass1'));
+    const base = first.accountStoreKeys[0]!;
+    const key1 = toKeyRecord({ ...base, ev: 0 });
+    const key2 = toKeyRecord({ ...base, ev: 1, id: 'mk-sort-test' });
+    // 2 existing keys → sort comparator (line 832) is invoked
+    const second = await mgr.updateMasterKey(
+      new TextEncoder().encode('pass2'),
+      [key1, key2],
+      new TextEncoder().encode('pass1'),
+    );
+    expect(second.accountStoreKeys[0]!.type).toBe('account');
   });
 });
 
@@ -1197,5 +1304,126 @@ describe('createCryptoStore — computedIndexes (nested sourceField)', () => {
       iv: expect.any(String),
       cipher: expect.any(String),
     });
+  });
+});
+
+// ─── createCryptoStore — reencrypt / forceReencrypt / checkAndFix ─────────────
+
+describe('createCryptoStore — reencrypt / forceReencrypt / checkAndFix', () => {
+  let rawStore: DexieStore<typeof evItemDefs>;
+  let cs: ReturnType<typeof createCryptoStore<typeof evItemDefs, MockKey>>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    rawStore = new DexieStore(`crypto-test-${++dbCounter}`, evItemDefs);
+    cs = createCryptoStore(rawStore, evItemDefs, mockManager);
+    cs.setMek(MOCK_KEY);
+  });
+
+  // ── reencrypt ────────────────────────────────────────────────────────────────
+
+  it('reencrypt throws when mek is not set', async () => {
+    cs.setMek(undefined);
+    await expect(cs.reencrypt(MOCK_KEY)).rejects.toThrow(
+      'Encryption key not loaded',
+    );
+  });
+
+  it('reencrypt bumps ev on all rows and re-encrypts them', async () => {
+    await cs.store.table.items.insert({ id: 'i1', name: 'Alice' });
+    const before = await rawStore.table.items.find('i1');
+    expect(before?.ev).toBe(0);
+
+    await cs.reencrypt(MOCK_KEY);
+
+    const after = await rawStore.table.items.find('i1');
+    expect(after?.ev).toBe(1);
+  });
+
+  it('reencrypt calls onProgress with running done/total counts', async () => {
+    await cs.store.table.items.insert({ id: 'i1', name: 'Alice' });
+    await cs.store.table.items.insert({ id: 'i2', name: 'Bob' });
+
+    const progress: Array<[number, number]> = [];
+    await cs.reencrypt(MOCK_KEY, (done, total) => {
+      progress.push([done, total]);
+    });
+
+    expect(progress).toContainEqual([2, 2]);
+  });
+
+  // ── forceReencrypt ───────────────────────────────────────────────────────────
+
+  it('forceReencrypt throws when mek is not set', async () => {
+    cs.setMek(undefined);
+    await expect(cs.forceReencrypt()).rejects.toThrow(
+      'Encryption key not loaded',
+    );
+  });
+
+  it('forceReencrypt re-encrypts all rows and data is still readable', async () => {
+    await cs.store.table.items.insert({
+      id: 'i1',
+      name: 'Alice',
+      secret: 'top-secret',
+    });
+    await cs.forceReencrypt();
+    const row = await cs.store.table.items.find('i1');
+    expect(row?.name).toBe('Alice');
+    expect(row?.secret).toBe('top-secret');
+  });
+
+  // ── checkAndFix / revalidateIds ──────────────────────────────────────────────
+
+  it('checkAndFix with no written tables is a no-op', async () => {
+    await expect(cs.checkAndFix({})).resolves.toBeUndefined();
+  });
+
+  it('checkAndFix with empty ids array exercises revalidateIds early-return', async () => {
+    await expect(cs.checkAndFix({ items: [] })).resolves.toBeUndefined();
+  });
+
+  it('checkAndFix with ids but no mek does not throw', async () => {
+    cs.setMek(undefined);
+    await expect(cs.checkAndFix({ items: ['i1'] })).resolves.toBeUndefined();
+  });
+
+  it('checkAndFix calls revalidateIds for rows with matching ev', async () => {
+    await cs.store.table.items.insert({ id: 'i1', name: 'Alice' });
+    await expect(cs.checkAndFix({ items: ['i1'] })).resolves.toBeUndefined();
+    const raw = await rawStore.table.items.find('i1');
+    expect(raw?.ev).toBe(0);
+  });
+
+  it('checkAndFix skips rows whose ev mismatches currentEv when old mek unavailable', async () => {
+    await cs.store.table.items.insert({ id: 'i1', name: 'Alice' });
+    // Raise currentEv to 1 without running reencrypt
+    cs.setMek(MOCK_KEY, 1);
+    // Raw row still has ev=0; hasOldMek=false → row filtered out → no fix
+    await cs.checkAndFix({ items: ['i1'] });
+    const raw = await rawStore.table.items.find('i1');
+    expect(raw?.ev).toBe(0);
+  });
+
+  it('checkAndFix detects and repairs a stale computed index (covers revalidateIds lines 428-432)', async () => {
+    const db = new DexieStore(`crypto-ev-email-${++dbCounter}`, evEmailDefs);
+    const emailCs = createCryptoStore(db, evEmailDefs, mockManager);
+    emailCs.setMek(MOCK_KEY);
+
+    await emailCs.store.table.contacts.insert({
+      id: 'c1',
+      email: 'alice@x.com',
+    });
+    // Corrupt the computed index to simulate staleness
+    const raw = await db.table.contacts.find('c1');
+    await db.table.contacts.upsertMany([{ ...raw!, emailIdx: null }]);
+
+    const before = await db.table.contacts.find('c1');
+    expect(before?.emailIdx).toBeNull();
+
+    await emailCs.checkAndFix({ contacts: ['c1'] });
+
+    const after = await db.table.contacts.find('c1');
+    expect(after?.emailIdx).not.toBeNull();
   });
 });

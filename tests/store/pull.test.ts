@@ -371,4 +371,14 @@ describe('pullClient', () => {
       pullClient({ items: store }, { fetcher, queries: { items: {} } }),
     ).resolves.toEqual({ items: [] });
   });
+
+  it('throws when server returns hasMore=true without pageSize', async () => {
+    const store = makeTable([]);
+    const fetcher = vi.fn(async () => ({ data: {}, hasMore: true as const }));
+    await expect(
+      pullClient({ items: store }, { fetcher, queries: { items: {} } }),
+    ).rejects.toThrow(
+      'pullClient: server returned hasMore=true without pageSize',
+    );
+  });
 });

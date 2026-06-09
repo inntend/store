@@ -877,3 +877,92 @@ describe('useAutoPull — full pull (tables with full: true)', () => {
     expect(fetcher).toHaveBeenCalledTimes(1);
   });
 });
+
+// ─── isRangeCovered — sort comparator ────────────────────────────────────────
+
+describe('isRangeCovered — out-of-order stored ranges trigger sort', () => {
+  it('handles ranges stored in reverse-chronological order (covers sort comparator returning 1)', async () => {
+    const fetcher = vi
+      .fn()
+      .mockResolvedValue({ data: { users: [] }, hasMore: false });
+    const store = makeStore();
+
+    // Ranges stored newest-first (out of order) — sort comparator must return 1
+    // to bring the earlier range first; query spans both so both are included in sort
+    await store.settings.set('pull', {
+      users: {
+        ranges: [
+          { from: '2024-02-01T00:00:00.000Z', to: '2024-02-28T00:00:00.000Z' },
+          { from: '2024-01-01T00:00:00.000Z', to: '2024-01-31T00:00:00.000Z' },
+        ],
+      },
+    });
+
+    renderHook(
+      () =>
+        useAutoPull({
+          store: mockSyncableStore(),
+          fetcher,
+          tables: {
+            users: {
+              range: {
+                from: new Date('2024-01-01'),
+                to: new Date('2024-02-28'),
+              },
+              field: 'updatedAt',
+            },
+          },
+        }),
+      { wrapper: makeWrapper(store) },
+    );
+
+    // Gap between Jan31 and Feb01 means range is not fully covered — pull fires
+    await waitFor(() => expect(fetcher).toHaveBeenCalledOnce());
+  });
+});
+
+// ─── mergeRanges — overlapping extension ─────────────────────────────────────
+
+describe('mergeRanges — overlapping ranges that extend existing coverage', () => {
+  it('merges an overlapping range that extends the current end (covers line 117)', async () => {
+    const fetcher = vi
+      .fn()
+      .mockResolvedValue({ data: { users: [] }, hasMore: false });
+    const store = makeStore();
+
+    let tables: Parameters<typeof useAutoPull>[0]['tables'] = {
+      users: {
+        range: { from: new Date('2024-01-01'), to: new Date('2024-02-28') },
+        field: 'updatedAt' as const,
+      },
+    };
+
+    const { rerender } = renderHook(
+      () => useAutoPull({ store: mockSyncableStore(), fetcher, tables }),
+      { wrapper: makeWrapper(store) },
+    );
+
+    await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(1));
+
+    // Overlapping range that starts before the existing end and goes beyond it
+    tables = {
+      users: {
+        range: { from: new Date('2024-02-15'), to: new Date('2024-03-31') },
+        field: 'updatedAt',
+      },
+    };
+    await act(async () => {
+      rerender();
+    });
+
+    await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(2));
+
+    const pullSettings = await store.settings.get('pull');
+    // After merge: single expanded range covering Jan 1 → Mar 31
+    expect(pullSettings?.users?.ranges).toHaveLength(1);
+    expect(pullSettings?.users?.ranges?.[0]).toMatchObject({
+      from: '2024-01-01T00:00:00.000Z',
+      to: '2024-03-31T00:00:00.000Z',
+    });
+  });
+});

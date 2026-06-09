@@ -294,4 +294,11 @@ describe('createSettingsHelper', () => {
     await ext.set('conflictResolution', { strategy: 'lww' });
     expect(await ext.get('conflictResolution')).toEqual({ strategy: 'lww' });
   });
+
+  it('delete removes a key so get returns undefined', async () => {
+    await settings.set('lastSynced', '2024-01-01T00:00:00.000Z');
+    expect(await settings.get('lastSynced')).toBe('2024-01-01T00:00:00.000Z');
+    await settings.delete('lastSynced');
+    expect(await settings.get('lastSynced')).toBeUndefined();
+  });
 });

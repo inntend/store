@@ -13,6 +13,7 @@ import {
 import {
   BACKOFF_INITIAL_MS,
   BACKOFF_MAX_MS,
+  buildUseSync,
   SYNC_REFRESH_INTERVAL_MS,
 } from '../../src/react/sync';
 import { defineStore, defineTable } from '../../src/store';
@@ -908,5 +909,79 @@ describe('useSync — auto-refresh', () => {
       await result.current.sync();
     });
     expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ─── buildUseSync — checkAndFix ───────────────────────────────────────────────
+
+describe('buildUseSync — checkAndFix called when records are written', () => {
+  it('calls checkAndFix with written IDs after a sync that upserts records', async () => {
+    const checkAndFix = vi.fn(async () => {});
+    const store = makeStore();
+
+    const useSyncWithFix = buildUseSync<typeof defs>(
+      () => store,
+      () => ({ syncState: 'online' as const, setSyncState: vi.fn() }),
+      () => checkAndFix,
+    );
+
+    const { result } = renderHook(
+      () =>
+        useSyncWithFix({
+          store: mockSyncableStore(),
+          fetcher: vi.fn().mockResolvedValue({
+            data: { users: [{ id: 'u1', updatedAt: new Date() }] },
+            hasMore: false,
+          }),
+          defaultFrom: new Date(0),
+          refreshInterval: 0,
+        }),
+      { wrapper: makeWrapper(store) },
+    );
+
+    await act(async () => {});
+    await act(async () => {
+      await result.current.sync();
+    });
+
+    expect(checkAndFix).toHaveBeenCalledWith(
+      expect.objectContaining({ users: ['u1'] }),
+    );
+  });
+
+  it('swallows checkAndFix errors and does not affect lastSynced', async () => {
+    const checkAndFix = vi.fn(async () => {
+      throw new Error('fix failed');
+    });
+    const store = makeStore();
+
+    const useSyncWithFix = buildUseSync<typeof defs>(
+      () => store,
+      () => ({ syncState: 'online' as const, setSyncState: vi.fn() }),
+      () => checkAndFix,
+    );
+
+    const { result } = renderHook(
+      () =>
+        useSyncWithFix({
+          store: mockSyncableStore(),
+          fetcher: vi.fn().mockResolvedValue({
+            data: { users: [{ id: 'u2', updatedAt: new Date() }] },
+            hasMore: false,
+          }),
+          defaultFrom: new Date(0),
+          refreshInterval: 0,
+        }),
+      { wrapper: makeWrapper(store) },
+    );
+
+    await act(async () => {});
+    await act(async () => {
+      await result.current.sync();
+    });
+
+    // checkAndFix threw but sync still succeeded
+    expect(result.current.lastSynced).toBeDefined();
+    expect(result.current.syncState).toBe('online');
   });
 });

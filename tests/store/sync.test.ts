@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { SyncClientParams } from '../../src/store/sync';
 import {
+  ClockSkewError,
   conflictResolutionSchema,
   sync,
   syncClient,
@@ -1007,5 +1008,42 @@ describe('syncClient', () => {
     await expect(
       syncClient({ items: store }, t0, { fetcher }),
     ).resolves.toMatchObject({ syncedTo: expect.any(Date) });
+  });
+
+  it('throws when server returns hasMore=true without pageSize', async () => {
+    const store = makeTable([]);
+    const fetcher = vi.fn(async () => ({ data: {}, hasMore: true as const }));
+    await expect(syncClient({ items: store }, t0, { fetcher })).rejects.toThrow(
+      'syncClient: server returned hasMore=true without pageSize',
+    );
+  });
+});
+
+// ─── ClockSkewError ────────────────────────────────────────────────────────────
+
+describe('ClockSkewError', () => {
+  it('stores clientTime, serverTime, and name in the error', () => {
+    const client = new Date('2024-01-01T12:00:00Z');
+    const server = new Date('2024-01-01T12:10:00Z');
+    const err = new ClockSkewError(client, server);
+    expect(err.clientTime).toBe(client);
+    expect(err.serverTime).toBe(server);
+    expect(err.name).toBe('ClockSkewError');
+    expect(err.message).toContain('Clock skew detected');
+  });
+});
+
+// ─── sync — clock skew ─────────────────────────────────────────────────────────
+
+describe('sync — clock skew', () => {
+  it('throws ClockSkewError when current time is more than 5 minutes in the past', async () => {
+    const table = makeTable([]);
+    const skewedCurrent = new Date(Date.now() - 10 * 60 * 1000);
+    await expect(
+      sync(
+        { items: table },
+        { current: skewedCurrent, from: t0, to: t4, delta: {} },
+      ),
+    ).rejects.toBeInstanceOf(ClockSkewError);
   });
 });

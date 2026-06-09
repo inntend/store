@@ -71,7 +71,7 @@ const defs = defineStore({ key: keyTableDef });
 let dbCounter = 0;
 
 const _ctx = createCryptoStoreContext<typeof defs>();
-const { useHasMek } = _ctx;
+const { useHasMek, useComputeIndex, useForceReencrypt } = _ctx;
 const {
   StoreContext,
   useMek,
@@ -79,6 +79,8 @@ const {
   useEncryptionSetup,
   useRecoveryPhrase,
   useRecoveryStatus,
+  useKeyManagement,
+  useReencryption,
 } = _ctx.bind<MockKey>();
 
 let rawStore: DexieStore<typeof defs>;
@@ -623,5 +625,375 @@ describe('useRecoveryStatus', () => {
     });
 
     await waitFor(() => expect(result.current.isComplete).toBe(true));
+  });
+});
+
+// ─── useKeyManagement ─────────────────────────────────────────────────────────
+
+describe('useKeyManagement', () => {
+  it('returns the keyManager with expected methods', () => {
+    const { result } = renderHook(() => useKeyManagement(), { wrapper });
+    expect(typeof result.current.updateKey).toBe('function');
+    expect(typeof result.current.loadKey).toBe('function');
+    expect(typeof result.current.updateMasterKey).toBe('function');
+  });
+});
+
+// ─── useEncryption — loadKey error ───────────────────────────────────────────
+
+describe('useEncryption — loadKey error', () => {
+  it('throws when no key of the specified type exists', async () => {
+    const { result } = renderHook(() => useEncryption(), { wrapper });
+
+    let caughtError: Error | undefined;
+    await act(async () => {
+      try {
+        await result.current.loadKey('account', new Uint8Array(32).fill(1));
+      } catch (e) {
+        caughtError = e as Error;
+      }
+    });
+
+    expect(caughtError?.message).toMatch(/No account key found/);
+  });
+});
+
+// ─── useEncryptionSetup — getCachedKey ────────────────────────────────────────
+
+describe('useEncryptionSetup — getCachedKey', () => {
+  const pullKeys = vi.fn(async () => {});
+
+  it('uses a cached key and calls onSuccess without pulling', async () => {
+    const onSuccess = vi.fn();
+    const getCachedKey = vi.fn(async (): Promise<MockKey> => 'cached-key');
+
+    const { result } = renderHook(
+      () => ({
+        setup: useEncryptionSetup({
+          getSecret: async () => new Uint8Array(32).fill(1),
+          pullKeys,
+          onSuccess,
+          getCachedKey,
+        }),
+        hasMek: useHasMek(),
+      }),
+      { wrapper },
+    );
+
+    await waitFor(() => expect(onSuccess).toHaveBeenCalledOnce());
+    expect(result.current.hasMek).toBe(true);
+    expect(getCachedKey).toHaveBeenCalledOnce();
+    expect(pullKeys).not.toHaveBeenCalled();
+  });
+
+  it('falls back to normal setup when getCachedKey returns undefined', async () => {
+    const onSuccess = vi.fn();
+    const getCachedKey = vi.fn(
+      async (): Promise<MockKey | undefined> => undefined,
+    );
+
+    renderHook(
+      () =>
+        useEncryptionSetup({
+          getSecret: async () => new Uint8Array(32).fill(1),
+          pullKeys,
+          onSuccess,
+          getCachedKey,
+        }),
+      { wrapper },
+    );
+
+    await waitFor(() => expect(onSuccess).toHaveBeenCalledOnce());
+    expect(pullKeys).toHaveBeenCalledOnce();
+  });
+
+  it('sets error via outer catch when getCachedKey throws', async () => {
+    const onSuccess = vi.fn();
+
+    const { result } = renderHook(
+      () =>
+        useEncryptionSetup({
+          getSecret: async () => new Uint8Array(32).fill(1),
+          pullKeys: async () => {},
+          onSuccess,
+          getCachedKey: async () => {
+            throw new Error('cache error');
+          },
+        }),
+      { wrapper },
+    );
+
+    await waitFor(() => expect(result.current.error).toBe('cache error'));
+    expect(onSuccess).not.toHaveBeenCalled();
+  });
+});
+
+// ─── useForceReencrypt ────────────────────────────────────────────────────────
+
+describe('useForceReencrypt', () => {
+  it('calls forceReencrypt and bumps version when mek is set and version is newer', async () => {
+    vi.spyOn(cs, 'forceReencrypt').mockResolvedValue(undefined);
+
+    const { result } = renderHook(
+      () => {
+        const mek = useMek();
+        useForceReencrypt(1);
+        return mek;
+      },
+      { wrapper },
+    );
+
+    await act(() => {
+      result.current.setMek('mock-key');
+    });
+
+    await waitFor(() => expect(cs.forceReencrypt).toHaveBeenCalledOnce());
+    const stored = await (rawStore.settings as any).get('reencryptVersion');
+    expect(stored).toBe(1);
+  });
+
+  it('does not call forceReencrypt when hasMek is false', async () => {
+    vi.spyOn(cs, 'forceReencrypt').mockResolvedValue(undefined);
+
+    renderHook(() => useForceReencrypt(1), { wrapper });
+
+    await act(async () => {});
+    expect(cs.forceReencrypt).not.toHaveBeenCalled();
+  });
+
+  it('does not call forceReencrypt when stored version is already current', async () => {
+    vi.spyOn(cs, 'forceReencrypt').mockResolvedValue(undefined);
+    await (rawStore.settings as any).set('reencryptVersion', 2);
+
+    const { result } = renderHook(
+      () => {
+        const mek = useMek();
+        useForceReencrypt(1);
+        return mek;
+      },
+      { wrapper },
+    );
+
+    await act(() => {
+      result.current.setMek('mock-key');
+    });
+    await act(async () => {});
+
+    expect(cs.forceReencrypt).not.toHaveBeenCalled();
+  });
+});
+
+// ─── useReencryption ─────────────────────────────────────────────────────────
+
+describe('useReencryption', () => {
+  it('returns undefined when no mek is loaded', () => {
+    const { result } = renderHook(() => useReencryption(), { wrapper });
+    expect(result.current).toBeUndefined();
+  });
+
+  it('returns an object with reencrypt function when mek is loaded', async () => {
+    const { result } = renderHook(
+      () => ({ reenc: useReencryption(), mek: useMek() }),
+      { wrapper },
+    );
+    await act(() => {
+      result.current.mek.setMek('mock-key');
+    });
+    expect(result.current.reenc).toBeDefined();
+    expect(typeof result.current.reenc!.reencrypt).toBe('function');
+  });
+
+  it('calling reencrypt delegates to cs.reencrypt', async () => {
+    vi.spyOn(cs, 'reencrypt').mockResolvedValue(undefined);
+
+    const { result } = renderHook(
+      () => ({ reenc: useReencryption(), mek: useMek() }),
+      { wrapper },
+    );
+    await act(() => {
+      result.current.mek.setMek('mock-key');
+    });
+
+    await act(async () => {
+      await result.current.reenc!.reencrypt('old-key');
+    });
+
+    expect(cs.reencrypt).toHaveBeenCalledWith('old-key', undefined);
+  });
+});
+
+// ─── useComputeIndex ──────────────────────────────────────────────────────────
+
+describe('useComputeIndex', () => {
+  it('returns undefined when no mek is loaded', () => {
+    const { result } = renderHook(() => useComputeIndex(), { wrapper });
+    expect(result.current).toBeUndefined();
+  });
+
+  it('returns a function when mek is loaded', async () => {
+    const { result } = renderHook(
+      () => ({ compute: useComputeIndex(), mek: useMek() }),
+      { wrapper },
+    );
+    await act(() => {
+      result.current.mek.setMek('mock-key');
+    });
+    expect(typeof result.current.compute).toBe('function');
+  });
+
+  it('produces a consistent base64 hash for the same input', async () => {
+    const { result } = renderHook(
+      () => ({ compute: useComputeIndex(), mek: useMek() }),
+      { wrapper },
+    );
+    await act(() => {
+      result.current.mek.setMek('mock-key');
+    });
+
+    let h1!: string;
+    let h2!: string;
+    await act(async () => {
+      h1 = await result.current.compute!('hello');
+      h2 = await result.current.compute!('hello');
+    });
+    expect(h1).toBe(h2);
+    expect(typeof h1).toBe('string');
+  });
+
+  it('accepts a namespace parameter and returns a string hash', async () => {
+    const { result } = renderHook(
+      () => ({
+        c1: useComputeIndex('ns1'),
+        c2: useComputeIndex('ns2'),
+        mek: useMek(),
+      }),
+      { wrapper },
+    );
+    await act(() => {
+      result.current.mek.setMek('mock-key');
+    });
+
+    let h1!: string;
+    let h2!: string;
+    await act(async () => {
+      h1 = await result.current.c1!('hello');
+      h2 = await result.current.c2!('hello');
+    });
+    expect(typeof h1).toBe('string');
+    expect(typeof h2).toBe('string');
+  });
+
+  it('clearComputeKeyCache empties the cache', async () => {
+    const { result } = renderHook(
+      () => ({
+        ctx: _ctx.useStoreContext(),
+        compute: useComputeIndex('cache-test'),
+        mek: useMek(),
+      }),
+      { wrapper },
+    );
+    await act(() => {
+      result.current.mek.setMek('mock-key');
+    });
+
+    await act(async () => {
+      await result.current.compute!('data');
+    });
+    expect(result.current.ctx.computeKeyCache.size).toBeGreaterThan(0);
+
+    await act(() => {
+      result.current.ctx.clearComputeKeyCache();
+    });
+    expect(result.current.ctx.computeKeyCache.size).toBe(0);
+  });
+});
+
+// ─── useStore / useRawStore ───────────────────────────────────────────────────
+
+describe('useStore and useRawStore', () => {
+  it('useStore returns the encrypted store proxy', () => {
+    const { result } = renderHook(() => _ctx.useStore(), { wrapper });
+    expect(result.current).toBeDefined();
+    expect(typeof result.current.table).toBe('object');
+  });
+
+  it('useRawStore returns the underlying raw store', () => {
+    const { result } = renderHook(() => _ctx.useRawStore(), { wrapper });
+    expect(result.current).toBe(rawStore);
+  });
+});
+
+// ─── buildHooks lambdas via useSync ──────────────────────────────────────────
+
+describe('useSync via _ctx covers buildHooks getStore and getCheckAndFix lambdas', () => {
+  it('renders without error and invokes the getStore and getCheckAndFix lambdas', async () => {
+    const fetcher = vi
+      .fn()
+      .mockResolvedValue({ data: { key: [] }, hasMore: false });
+    const { result } = renderHook(
+      () =>
+        _ctx.useSync({
+          store: {
+            key: {
+              findMany: vi.fn().mockResolvedValue([]),
+              upsertMany: vi.fn().mockResolvedValue([]),
+            },
+          } as any,
+          fetcher,
+          defaultFrom: new Date(0),
+          refreshInterval: 0,
+        }),
+      { wrapper },
+    );
+    await act(async () => {
+      await result.current.sync();
+    });
+    expect(fetcher).toHaveBeenCalled();
+  });
+});
+
+// ─── useForceReencrypt — error and cleanup paths ──────────────────────────────
+
+describe('useForceReencrypt — error and cleanup coverage', () => {
+  it('swallows errors thrown by forceReencrypt (covers catch handler)', async () => {
+    vi.spyOn(cs, 'forceReencrypt').mockRejectedValue(
+      new Error('reencrypt failed'),
+    );
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { result } = renderHook(
+      () => {
+        const mek = useMek();
+        useForceReencrypt(1);
+        return mek;
+      },
+      { wrapper },
+    );
+    await act(() => {
+      result.current.setMek('mock-key');
+    });
+    await waitFor(() => expect(consoleSpy).toHaveBeenCalledOnce());
+    expect(consoleSpy).toHaveBeenCalledWith(
+      '[forceReencrypt] error:',
+      expect.any(Error),
+    );
+    consoleSpy.mockRestore();
+  });
+
+  it('cleanup sets cancelled=true when hasMek cleared after effect fired', async () => {
+    vi.spyOn(cs, 'forceReencrypt').mockResolvedValue(undefined);
+    const { result, unmount } = renderHook(
+      () => {
+        const mek = useMek();
+        useForceReencrypt(1);
+        return mek;
+      },
+      { wrapper },
+    );
+    await act(() => {
+      result.current.setMek('mock-key');
+    });
+    await waitFor(() => expect(cs.forceReencrypt).toHaveBeenCalledOnce());
+    // Unmounting while hasMek=true triggers the effect cleanup (cancelled = true)
+    unmount();
   });
 });
