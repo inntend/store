@@ -43,6 +43,19 @@ type SettingsSchema = typeof SETTINGS_SCHEMA;
 export type SettingsTableDef = TableDef<SettingsSchema, 'key'>;
 
 /**
+ * Resolves the `SettingsTableDef` used by both adapters.
+ * Priority: explicit `settingsKeys` → `defs.settings` → default.
+ */
+export function resolveSettingsDef<ExtraKeys extends string>(
+  defs: Record<string, unknown>,
+  settingsKeys?: readonly ExtraKeys[],
+): SettingsTableDef {
+  if (settingsKeys?.length) return createSettingsDef(settingsKeys);
+  if ('settings' in defs) return defs.settings as SettingsTableDef;
+  return createSettingsDef();
+}
+
+/**
  * Creates a `TableDef` for the settings table. Defaults to `"__store_settings"`.
  *
  * Pass `extraKeys` to register additional keys on top of the built-in ones.

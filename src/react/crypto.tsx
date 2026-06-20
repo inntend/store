@@ -31,7 +31,7 @@ import { createPasskeyHooks } from './passkey';
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-async function findKey<TDefs extends Record<string, AnyTableDef>>(
+export async function findKey<TDefs extends Record<string, AnyTableDef>>(
   store: EncryptedStore<TDefs, any>,
   type: KEKType,
 ) {

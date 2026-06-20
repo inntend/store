@@ -6,6 +6,8 @@ import {
   type FindQuery,
   type ManagedKeys,
   type MutableInput,
+  normalizePrimaryKey,
+  stripManaged,
   type StoreTable,
   type TableDef,
 } from '../store';
@@ -38,11 +40,7 @@ export class DexieStoreTable<
     this.hasModified = 'updatedAt' in def.schema.shape;
     this.hasCreated = 'createdAt' in def.schema.shape;
     this.hasDeleted = 'deleted' in def.schema.shape;
-    this.pkName = (
-      Array.isArray(def.primaryKey)
-        ? def.primaryKey[0]
-        : (def.primaryKey ?? 'id')
-    ) as string;
+    this.pkName = normalizePrimaryKey(def.primaryKey)[0];
   }
 
   async find(
@@ -128,19 +126,6 @@ export class DexieStoreTable<
     };
   }
 
-  private static stripManaged(partial: Record<string, unknown>) {
-    const {
-      createdAt: _c,
-      deleted: _d,
-      updatedAt: _u,
-      mv: _mv,
-      ev: _ev,
-      syncedAt: _s,
-      ...rest
-    } = partial;
-    return rest;
-  }
-
   async insert(data: MutableInput<S, PK>, options?: { validate?: boolean }) {
     type Doc = z.infer<S>;
     const stamped = this.stampInsert(
@@ -176,7 +161,7 @@ export class DexieStoreTable<
     const now = new Date();
     // `createdAt` is set-once by insert; `deleted` is managed by delete.
     // Strip both so callers can't accidentally mutate them through update.
-    const rest = DexieStoreTable.stripManaged(
+    const rest = stripManaged(
       partial as Record<string, unknown>,
     );
     const stamped = { ...rest, ...(this.hasModified && { updatedAt: now }) };
@@ -198,7 +183,7 @@ export class DexieStoreTable<
     const rows = await this.findMany({ where: query.where });
     if (rows.length === 0) return 0;
     const now = new Date();
-    const rest = DexieStoreTable.stripManaged(
+    const rest = stripManaged(
       partial as Record<string, unknown>,
     );
     const stamp = { ...rest, ...(this.hasModified && { updatedAt: now }) };

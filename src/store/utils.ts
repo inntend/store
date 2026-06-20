@@ -58,6 +58,9 @@ export const syncableMetaSchema = z
   })
   .loose();
 
+/** Pre-built schema for parsing arrays of syncable records from the network. */
+export const syncableMetaArraySchema = z.array(syncableMetaSchema);
+
 // ─── Private helpers ───────────────────────────────────────────────────────────
 
 export async function batchUpsert(

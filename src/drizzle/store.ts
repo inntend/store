@@ -25,13 +25,14 @@ import { v7 as uuidv7 } from 'uuid';
 import type { z } from 'zod';
 import {
   type AnyTableDef,
-  createSettingsDef,
   type DefaultSettingsValues,
   type FindQuery,
   type ManagedKeys,
   type MutableInput,
+  resolveSettingsDef,
   type SettingsTableDef,
   Store,
+  stripManaged,
   type StoreTable,
   type StoreType,
   type TableDef,
@@ -238,19 +239,6 @@ class DrizzleStoreTable<
     return { ...data, [this.pkName]: uuidv7() };
   }
 
-  private static stripManaged(partial: Record<string, unknown>) {
-    const {
-      createdAt: _c,
-      deleted: _d,
-      updatedAt: _u,
-      mv: _mv,
-      ev: _ev,
-      syncedAt: _s,
-      ...rest
-    } = partial;
-    return rest;
-  }
-
   async insert(data: MutableInput<S, PK>, options?: { validate?: boolean }) {
     type Doc = z.infer<S>;
     const now = new Date();
@@ -302,7 +290,7 @@ class DrizzleStoreTable<
     const now = new Date();
     // `createdAt` is set-once by insert; `deleted` is managed by delete.
     // Strip both from the partial so callers can't accidentally mutate them.
-    const rest = DrizzleStoreTable.stripManaged(
+    const rest = stripManaged(
       partial as Record<string, unknown>,
     );
     const stamped = { ...rest, ...(this.hasModified && { updatedAt: now }) };
@@ -325,7 +313,7 @@ class DrizzleStoreTable<
     partial: Partial<Omit<z.infer<S>, ManagedKeys<S>>>,
   ) {
     const now = new Date();
-    const rest = DrizzleStoreTable.stripManaged(
+    const rest = stripManaged(
       partial as Record<string, unknown>,
     );
     const stamped = { ...rest, ...(this.hasModified && { updatedAt: now }) };
@@ -476,16 +464,7 @@ export class DrizzleStore<
       settingsKeys,
     }: { maxVars?: number; settingsKeys?: readonly ExtraKeys[] } = {},
   ) {
-    // When extra keys are supplied, always build a fresh settings def so the
-    // zod enum includes them. Otherwise fall back to the one in defs (injected
-    // by defineStore) or the default.
-    const settingsDef = (
-      settingsKeys?.length
-        ? createSettingsDef(settingsKeys)
-        : 'settings' in defs
-          ? (defs as Record<string, unknown>).settings
-          : createSettingsDef()
-    ) as SettingsTableDef;
+    const settingsDef = resolveSettingsDef(defs as Record<string, unknown>, settingsKeys);
     const settingsTable = new DrizzleStoreTable(
       db,
       settingsDef,

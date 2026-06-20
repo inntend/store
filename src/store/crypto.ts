@@ -9,6 +9,7 @@ import type {
 } from './settings';
 import { Store } from './store';
 import type { AnyTableDef, MutableInput, StoreTable, TableDef } from './table';
+import { normalizePrimaryKey } from './table';
 
 // ─── Key schemas ──────────────────────────────────
 
@@ -1002,11 +1003,7 @@ export function createCryptoStore<
         defs[key]?.decryptedSchema ??
         (tableMigrations.length === 0 ? defs[key]?.schema : undefined);
 
-      const pkName = (
-        Array.isArray(defs[key]?.primaryKey)
-          ? (defs[key].primaryKey as string[])[0]
-          : ((defs[key]?.primaryKey as string | undefined) ?? 'id')
-      ) as string;
+      const pkName = normalizePrimaryKey(defs[key]?.primaryKey)[0];
 
       const computedIndexes = (defs[key]?.computedIndexes ??
         []) as ComputedIndexSpec[];
@@ -1058,11 +1055,7 @@ export function createCryptoStore<
         for (const [name, encTable] of Object.entries(encryptedTables)) {
           const def = defs[name as keyof TDefs];
           if (!def?.encryptedFields?.length) continue;
-          const pkField = (
-            Array.isArray(def.primaryKey)
-              ? (def.primaryKey as string[])[0]
-              : ((def.primaryKey as string | undefined) ?? 'id')
-          ) as string;
+          const pkField = normalizePrimaryKey(def.primaryKey)[0];
 
           // Fetch all raw rows that still carry the old ev — bounded, no loop
           const rawTable = (rawStore.table as Record<string, AnyTable>)[name]!;

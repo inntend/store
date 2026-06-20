@@ -3,6 +3,7 @@ import { useRef, useState } from 'react';
 import { v7 as uuidv7 } from 'uuid';
 import type { AnyTableDef } from '../store';
 import type { EncryptedStore } from '../store/crypto';
+import { findKey } from './crypto';
 import type { CryptoContextBase } from './crypto';
 
 export type RotationPhase =
@@ -19,17 +20,14 @@ async function findPasskeyKeys<TDefs extends Record<string, AnyTableDef>>(
   return store.table.key.findMany({ where: { type: { $eq: type } } });
 }
 
-async function findPasskeyKey<TDefs extends Record<string, AnyTableDef>>(
-  store: EncryptedStore<TDefs, any>,
-  type: 'account' | 'recovery',
-) {
-  return (
-    await store.table.key.findMany({
-      where: { type: { $eq: type } },
-      orderBy: { ev: 'desc', createdAt: 'desc' },
-      limit: 1,
-    })
-  )?.[0];
+function preserveFirstKeyId<T extends { id: string }>(
+  storeKeys: T[],
+  existingId?: string,
+): T[] {
+  return storeKeys.map((sk, i) => ({
+    ...sk,
+    id: i === 0 ? (existingId ?? uuidv7()) : uuidv7(),
+  }));
 }
 
 export function createPasskeyHooks<TDefs extends Record<string, AnyTableDef>>(
@@ -98,7 +96,7 @@ export function createPasskeyHooks<TDefs extends Record<string, AnyTableDef>>(
         }
 
         if (encryptFailed) {
-          const recoveryKey = await findPasskeyKey(store, 'recovery');
+          const recoveryKey = await findKey(store, 'recovery');
           if (!recoveryKey)
             throw new Error(
               'Could not re-encrypt with the new passkey and no recovery phrase is configured.',
@@ -148,7 +146,7 @@ export function createPasskeyHooks<TDefs extends Record<string, AnyTableDef>>(
         newSecret = await options.getNewSecret();
 
         setState({ status: 'running', stepIndex: 3 });
-        const accountKey = await findPasskeyKey(store, 'account');
+        const accountKey = await findKey(store, 'account');
         const { storeKeys } = await keyManager.updateKey(
           'account',
           newSecret,
@@ -156,10 +154,7 @@ export function createPasskeyHooks<TDefs extends Record<string, AnyTableDef>>(
           phraseSeed,
         );
         await store.table.key.upsertMany(
-          storeKeys.map((sk: any, i: number) => ({
-            ...sk,
-            id: i === 0 ? (accountKey?.id ?? uuidv7()) : uuidv7(),
-          })),
+          preserveFirstKeyId(storeKeys as any[], accountKey?.id),
         );
 
         await options.sync?.();
@@ -187,7 +182,7 @@ export function createPasskeyHooks<TDefs extends Record<string, AnyTableDef>>(
         const recoveryKeys = await findPasskeyKeys(store, 'recovery');
         if (recoveryKeys.length === 0)
           throw new Error('Recovery key not found.');
-        const accountKey = await findPasskeyKey(store, 'account');
+        const accountKey = await findKey(store, 'account');
         const { storeKeys } = await keyManager.updateKey(
           'account',
           newSecret,
@@ -195,10 +190,7 @@ export function createPasskeyHooks<TDefs extends Record<string, AnyTableDef>>(
           phraseSeed,
         );
         await store.table.key.upsertMany(
-          storeKeys.map((sk: any, i: number) => ({
-            ...sk,
-            id: i === 0 ? (accountKey?.id ?? uuidv7()) : uuidv7(),
-          })),
+          preserveFirstKeyId(storeKeys as any[], accountKey?.id),
         );
         await options.sync?.();
 

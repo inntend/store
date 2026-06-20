@@ -3,10 +3,10 @@ import { createFindQuerySchema, type FindQuery } from './filter';
 import type { AnyTableDef, TableDef } from './table';
 import {
   batchUpsert,
+  syncableMetaArraySchema,
   type SyncableMeta,
   type SyncableStore,
   type SyncResult,
-  syncableMetaSchema,
 } from './utils';
 
 // ─── Types ─────────────────────────────────────────────────────────────────────
@@ -183,7 +183,7 @@ export async function pullClient(
       tableNames.map(async (t) => {
         const ids = await batchUpsert(
           store[t]!,
-          z.array(syncableMetaSchema).parse(result?.data?.[t] ?? []),
+          syncableMetaArraySchema.parse(result?.data?.[t] ?? []),
           batchSize,
         );
         return [t, ids] as [string, string[]];

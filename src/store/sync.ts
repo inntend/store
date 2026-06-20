@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import {
   batchUpsert,
+  syncableMetaArraySchema,
   type SyncableMeta,
   type SyncableStore,
   type SyncResult,
@@ -280,13 +281,12 @@ export async function syncClient(
   // Pagination loop: full delta on first page; empty delta on subsequent pages.
   let pageOffset = 0;
   let hasMore = true;
-  let isFirstPage = true;
   const written: Record<string, string[]> = Object.fromEntries(
     tableNames.map((t) => [t, []]),
   );
 
   while (hasMore) {
-    const delta = isFirstPage ? clientDelta : {};
+    const delta = pageOffset === 0 ? clientDelta : {};
     const result = await fetcher({
       current: to,
       from,
@@ -300,7 +300,7 @@ export async function syncClient(
       tableNames.map((t) =>
         batchUpsert(
           store[t],
-          z.array(syncableMetaSchema).parse(result?.data?.[t] ?? []),
+          syncableMetaArraySchema.parse(result?.data?.[t] ?? []),
           batchSize,
         ),
       ),
@@ -313,7 +313,6 @@ export async function syncClient(
         'syncClient: server returned hasMore=true without pageSize — cannot advance pagination',
       );
     }
-    isFirstPage = false;
     if (result?.pageSize != null) pageOffset += result.pageSize;
   }
 
