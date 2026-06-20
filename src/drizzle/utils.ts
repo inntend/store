@@ -133,14 +133,7 @@ export function buildColumn<T>(
 
 // ─── Primary key + index helpers ──────────────────────────────────────────────
 
-export function normalizePrimaryKey(
-  rawPk: string | readonly string[] | undefined,
-): [string, ...string[]] {
-  return (Array.isArray(rawPk) ? [...rawPk] : [(rawPk as string) ?? 'id']) as [
-    string,
-    ...string[],
-  ];
-}
+export { normalizePrimaryKey } from '../store/table';
 
 export function resolveIndexName(
   tableName: string,

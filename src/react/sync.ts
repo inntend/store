@@ -146,7 +146,7 @@ export function buildUseSync<TDefs extends Record<string, AnyTableDef>>(
     // see the latest options (fetcher, batchSize, defaultFrom, conflictResolution)
     // even when the hook re-renders without triggering a new effect.
     const runSync = async () => {
-      const state = syncStateRef.current as SyncState;
+      const state = syncStateRef.current;
       if (state === 'disabled') return;
       if (syncingRef.current) return;
       syncingRef.current = true;
@@ -177,8 +177,7 @@ export function buildUseSync<TDefs extends Record<string, AnyTableDef>>(
         setLastSyncedState(iso);
         // Success: reset backoff, restore online if we were offline.
         backoffDelayRef.current = BACKOFF_INITIAL_MS;
-        if ((syncStateRef.current as SyncState) === 'offline')
-          setSyncState('online');
+        if (syncStateRef.current === 'offline') setSyncState('online');
       } catch (err) {
         console.error(
           '[useSync] sync failed:',
@@ -188,7 +187,7 @@ export function buildUseSync<TDefs extends Record<string, AnyTableDef>>(
           err,
         );
         // Failure: go offline and trigger backoff (no-op when disabled)
-        if ((syncStateRef.current as SyncState) !== 'disabled') {
+        if (syncStateRef.current !== 'disabled') {
           setSyncState('offline');
           setRetryTrigger((n) => n + 1);
         }

@@ -88,6 +88,32 @@ export interface TableDef<
   }>;
 }
 
+/** Returns the first (or only) primary-key field name from a raw `primaryKey` value. */
+export function normalizePrimaryKey(
+  rawPk: string | readonly string[] | undefined,
+): [string, ...string[]] {
+  return (Array.isArray(rawPk) ? [...rawPk] : [(rawPk as string) ?? 'id']) as [
+    string,
+    ...string[],
+  ];
+}
+
+/** Strips all managed fields from a partial row, returning the rest. */
+export function stripManaged(
+  partial: Record<string, unknown>,
+): Record<string, unknown> {
+  const {
+    createdAt: _c,
+    deleted: _d,
+    updatedAt: _u,
+    mv: _mv,
+    ev: _ev,
+    syncedAt: _s,
+    ...rest
+  } = partial;
+  return rest;
+}
+
 /**
  * Declares a single table: its Zod schema, primary key, optional indexes, and
  * optional encrypted fields. The returned object is the single source of truth

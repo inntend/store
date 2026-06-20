@@ -1,8 +1,8 @@
 import Dexie, { type Transaction } from 'dexie';
 import {
   type AnyTableDef,
-  createSettingsDef,
   type DefaultSettingsValues,
+  resolveSettingsDef,
   type SettingsTableDef,
   Store,
   type StoreType,
@@ -84,16 +84,10 @@ export class DexieStore<
   ) {
     const { migrations, settingsKeys } = options ?? {};
 
-    // When extra keys are supplied, always build a fresh settings def so the
-    // zod enum includes them. Otherwise fall back to the one in defs (injected
-    // by defineStore) or the default.
-    const settingsDef = (
-      settingsKeys?.length
-        ? createSettingsDef(settingsKeys)
-        : 'settings' in defs
-          ? (defs as Record<string, unknown>).settings
-          : createSettingsDef()
-    ) as SettingsTableDef;
+    const settingsDef = resolveSettingsDef(
+      defs as Record<string, unknown>,
+      settingsKeys,
+    );
 
     const allDefs = { ...defs, settings: settingsDef } as T & {
       settings: SettingsTableDef;
