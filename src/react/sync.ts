@@ -177,8 +177,7 @@ export function buildUseSync<TDefs extends Record<string, AnyTableDef>>(
         setLastSyncedState(iso);
         // Success: reset backoff, restore online if we were offline.
         backoffDelayRef.current = BACKOFF_INITIAL_MS;
-        if (syncStateRef.current === 'offline')
-          setSyncState('online');
+        if (syncStateRef.current === 'offline') setSyncState('online');
       } catch (err) {
         console.error(
           '[useSync] sync failed:',

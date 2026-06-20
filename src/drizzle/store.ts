@@ -30,11 +30,10 @@ import {
   type ManagedKeys,
   type MutableInput,
   resolveSettingsDef,
-  type SettingsTableDef,
   Store,
-  stripManaged,
   type StoreTable,
   type StoreType,
+  stripManaged,
   type TableDef,
   type WhereClause,
 } from '../store';
@@ -290,9 +289,7 @@ class DrizzleStoreTable<
     const now = new Date();
     // `createdAt` is set-once by insert; `deleted` is managed by delete.
     // Strip both from the partial so callers can't accidentally mutate them.
-    const rest = stripManaged(
-      partial as Record<string, unknown>,
-    );
+    const rest = stripManaged(partial as Record<string, unknown>);
     const stamped = { ...rest, ...(this.hasModified && { updatedAt: now }) };
     const [row] = await this.db
       .update(this.table)
@@ -313,9 +310,7 @@ class DrizzleStoreTable<
     partial: Partial<Omit<z.infer<S>, ManagedKeys<S>>>,
   ) {
     const now = new Date();
-    const rest = stripManaged(
-      partial as Record<string, unknown>,
-    );
+    const rest = stripManaged(partial as Record<string, unknown>);
     const stamped = { ...rest, ...(this.hasModified && { updatedAt: now }) };
     let cond: SQL | undefined = query.where
       ? translateWhere(this.table, query.where)
@@ -464,7 +459,10 @@ export class DrizzleStore<
       settingsKeys,
     }: { maxVars?: number; settingsKeys?: readonly ExtraKeys[] } = {},
   ) {
-    const settingsDef = resolveSettingsDef(defs as Record<string, unknown>, settingsKeys);
+    const settingsDef = resolveSettingsDef(
+      defs as Record<string, unknown>,
+      settingsKeys,
+    );
     const settingsTable = new DrizzleStoreTable(
       db,
       settingsDef,

@@ -3,10 +3,10 @@ import { createFindQuerySchema, type FindQuery } from './filter';
 import type { AnyTableDef, TableDef } from './table';
 import {
   batchUpsert,
-  syncableMetaArraySchema,
   type SyncableMeta,
   type SyncableStore,
   type SyncResult,
+  syncableMetaArraySchema,
 } from './utils';
 
 // ─── Types ─────────────────────────────────────────────────────────────────────

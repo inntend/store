@@ -84,7 +84,10 @@ export class DexieStore<
   ) {
     const { migrations, settingsKeys } = options ?? {};
 
-    const settingsDef = resolveSettingsDef(defs as Record<string, unknown>, settingsKeys);
+    const settingsDef = resolveSettingsDef(
+      defs as Record<string, unknown>,
+      settingsKeys,
+    );
 
     const allDefs = { ...defs, settings: settingsDef } as T & {
       settings: SettingsTableDef;

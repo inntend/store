@@ -1,10 +1,10 @@
 import { z } from 'zod';
 import {
   batchUpsert,
-  syncableMetaArraySchema,
   type SyncableMeta,
   type SyncableStore,
   type SyncResult,
+  syncableMetaArraySchema,
   syncableMetaSchema,
 } from './utils';
 

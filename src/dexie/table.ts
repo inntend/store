@@ -7,8 +7,8 @@ import {
   type ManagedKeys,
   type MutableInput,
   normalizePrimaryKey,
-  stripManaged,
   type StoreTable,
+  stripManaged,
   type TableDef,
 } from '../store';
 import { applyNativeFilter, buildComparator, matchesWhere } from './filter';
@@ -161,9 +161,7 @@ export class DexieStoreTable<
     const now = new Date();
     // `createdAt` is set-once by insert; `deleted` is managed by delete.
     // Strip both so callers can't accidentally mutate them through update.
-    const rest = stripManaged(
-      partial as Record<string, unknown>,
-    );
+    const rest = stripManaged(partial as Record<string, unknown>);
     const stamped = { ...rest, ...(this.hasModified && { updatedAt: now }) };
     const count = await this.tbl.update(
       id,
@@ -183,9 +181,7 @@ export class DexieStoreTable<
     const rows = await this.findMany({ where: query.where });
     if (rows.length === 0) return 0;
     const now = new Date();
-    const rest = stripManaged(
-      partial as Record<string, unknown>,
-    );
+    const rest = stripManaged(partial as Record<string, unknown>);
     const stamp = { ...rest, ...(this.hasModified && { updatedAt: now }) };
     await this.tbl.bulkPut(
       rows.map((r) => ({ ...r, ...(stamp as Partial<Doc>) })) as Doc[],

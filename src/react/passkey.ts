@@ -3,8 +3,8 @@ import { useRef, useState } from 'react';
 import { v7 as uuidv7 } from 'uuid';
 import type { AnyTableDef } from '../store';
 import type { EncryptedStore } from '../store/crypto';
-import { findKey } from './crypto';
 import type { CryptoContextBase } from './crypto';
+import { findKey } from './crypto';
 
 export type RotationPhase =
   | { status: 'idle' }
