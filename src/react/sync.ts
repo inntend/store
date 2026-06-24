@@ -27,6 +27,13 @@ export type UseSyncOptions = {
   /** Max records per `upsertMany` call. */
   batchSize?: number;
   /**
+   * Table names to exclude from sync. Default: `['settings']`. A caller-provided
+   * list replaces the default (include `'settings'` to keep skipping it). Use to
+   * keep device-local/ephemeral tables out of the synced delta. See
+   * `SyncClientParams.skip`.
+   */
+  skip?: string[];
+  /**
    * Fallback `from` date used when `lastSynced` has never been persisted.
    */
   defaultFrom: Date;
@@ -151,7 +158,7 @@ export function buildUseSync<TDefs extends Record<string, AnyTableDef>>(
       if (syncingRef.current) return;
       syncingRef.current = true;
       setSyncing(true);
-      const { fetcher, batchSize, defaultFrom } = optionsRef.current;
+      const { fetcher, batchSize, skip, defaultFrom } = optionsRef.current;
       const from = lastSyncedRef.current
         ? new Date(lastSyncedRef.current)
         : defaultFrom;
@@ -159,6 +166,7 @@ export function buildUseSync<TDefs extends Record<string, AnyTableDef>>(
         const { syncedTo, written } = await syncClient(syncStore, from, {
           fetcher,
           batchSize,
+          skip,
           conflictResolution: conflictResolutionRef.current,
         });
         const checkAndFix = checkAndFixRef.current;

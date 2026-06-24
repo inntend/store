@@ -40,6 +40,13 @@ export type SyncClientParams = {
    * The server applies this when the same record exists on both sides.
    */
   conflictResolution?: ConflictResolution;
+  /**
+   * Table names to exclude from sync. Default: `['settings']`. Mirrors the
+   * server `SyncOptions.skip` — use it to keep device-local/ephemeral tables
+   * (e.g. short-TTL locks) out of the delta entirely. A caller-provided list
+   * replaces the default, so include `'settings'` if you still want it skipped.
+   */
+  skip?: string[];
 };
 
 export type SyncClientResult = {
@@ -258,11 +265,17 @@ export async function syncClient(
   from: Date,
   params: SyncClientParams,
 ): Promise<SyncClientResult> {
-  const { fetcher, batchSize, conflictResolution } = params;
+  const {
+    fetcher,
+    batchSize,
+    conflictResolution,
+    skip = ['settings'],
+  } = params;
   const to = new Date();
 
   // syncClient shares the same skip default as sync() — both ends skip 'settings'
-  const tableNames = discoverTables(store, ['settings']);
+  // unless the caller overrides (e.g. to also drop device-local tables).
+  const tableNames = discoverTables(store, skip);
 
   // Collect local changes for all tables in parallel.
   // `deleted: true` ensures soft-deleted rows propagate to the server.
