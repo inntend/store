@@ -306,6 +306,36 @@ function getNestedValue(obj: Record<string, unknown>, path: string): unknown {
     );
 }
 
+// Per-row crypto runs on the JS thread (JSON (de)serialization + the WebCrypto /
+// native-module bridge). Resolving thousands of these at once — e.g. an initial
+// sync delta — floods the microtask queue and freezes the UI until it drains.
+// Process in bounded chunks and yield a macrotask between them so the host can
+// paint a frame and handle input. Batches ≤ chunk run in a single pass (no extra
+// latency for ordinary reads/writes). The chunk size is tunable per store via
+// `createCryptoStore`'s `chunkSize` option (smaller = smoother but slower).
+const DEFAULT_CRYPTO_CHUNK = 64;
+
+// A macrotask yield — gives the event loop a turn to render/handle input.
+// setTimeout(0) is the one primitive available on web, React Native and Node.
+function yieldToHost(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+async function mapChunked<I, O>(
+  items: I[],
+  fn: (item: I) => Promise<O>,
+  chunkSize: number = DEFAULT_CRYPTO_CHUNK,
+): Promise<O[]> {
+  const size = Math.max(1, chunkSize);
+  if (items.length <= size) return Promise.all(items.map(fn));
+  const out: O[] = [];
+  for (let i = 0; i < items.length; i += size) {
+    out.push(...(await Promise.all(items.slice(i, i + size).map(fn))));
+    if (i + size < items.length) await yieldToHost();
+  }
+  return out;
+}
+
 class CryptoStoreTable<TKey> implements AnyTable {
   readonly schema: any;
 
@@ -324,6 +354,8 @@ class CryptoStoreTable<TKey> implements AnyTable {
     private readonly getCurrentEv: () => number,
     private readonly computedIndexes: readonly ComputedIndexSpec[],
     private readonly computeConfig: ComputeConfig,
+    // Rows per chunk for bulk encrypt/decrypt; the loop yields between chunks.
+    private readonly chunkSize: number = DEFAULT_CRYPTO_CHUNK,
   ) {
     this.schema = underlying.schema;
   }
@@ -496,14 +528,15 @@ class CryptoStoreTable<TKey> implements AnyTable {
 
   async findMany(query?: unknown, _options?: any) {
     const rows: Row[] = await this.underlying.findMany(query as any);
-    return Promise.all(
-      rows.map((row) =>
+    return mapChunked(
+      rows,
+      (row) =>
         this.decRow(row).catch((e) => {
           throw new Error(
             `Failed to decrypt row ${String(row[this.pkName])}: ${e}`,
           );
         }),
-      ),
+      this.chunkSize,
     );
   }
 
@@ -517,9 +550,13 @@ class CryptoStoreTable<TKey> implements AnyTable {
   }
 
   async insertMany(data: Row[], _options?: any) {
-    const encoded = await Promise.all(data.map((r) => this.encRow(r)));
+    const encoded = await mapChunked(
+      data,
+      (r) => this.encRow(r),
+      this.chunkSize,
+    );
     const rows: Row[] = await this.underlying.insertMany(encoded);
-    return Promise.all(rows.map((r) => this.decRow(r)));
+    return mapChunked(rows, (r) => this.decRow(r), this.chunkSize);
   }
 
   async update(id: unknown, partial: Row, _options?: any) {
@@ -550,8 +587,10 @@ class CryptoStoreTable<TKey> implements AnyTable {
     const rows = await this.findMany(query as any);
     if (rows.length === 0) return 0;
     const now = new Date();
-    const encRows = await Promise.all(
-      rows.map((row) => this.encRow({ ...row, ...partial, updatedAt: now })),
+    const encRows = await mapChunked(
+      rows,
+      (row) => this.encRow({ ...row, ...partial, updatedAt: now }),
+      this.chunkSize,
     );
     // sync:true so mv=currentVersion is included in the upsert.
     await this.underlying.upsertMany(encRows, { sync: true });
@@ -567,7 +606,11 @@ class CryptoStoreTable<TKey> implements AnyTable {
   }
 
   async upsertMany(data: Row[], options?: { sync?: boolean }) {
-    const encoded = await Promise.all(data.map((r) => this.encRow(r)));
+    const encoded = await mapChunked(
+      data,
+      (r) => this.encRow(r),
+      this.chunkSize,
+    );
     // Pass validate:false so the adapter skips schema validation on encrypted rows
     // (CryptoPayload objects are not the plain types the storage schema declares).
     // The underlying adapter's schema.parse() will run on the encrypted rows.
@@ -576,7 +619,7 @@ class CryptoStoreTable<TKey> implements AnyTable {
     const rows: Row[] = await (options?.sync
       ? this.underlying.upsertMany(encoded, { sync: true })
       : this.underlying.upsertMany(encoded));
-    return Promise.all(rows.map((r) => this.decRow(r)));
+    return mapChunked(rows, (r) => this.decRow(r), this.chunkSize);
   }
 }
 
@@ -966,6 +1009,13 @@ export function createCryptoStore<
   options?: {
     migrations?: MigrationMap<TDefs>;
     config?: KeyConfig;
+    /**
+     * Rows per chunk for bulk encrypt/decrypt (findMany/upsertMany/…). The loop
+     * yields a macrotask between chunks so large operations (e.g. an initial
+     * sync delta) don't block the JS thread / freeze the UI. Smaller = smoother
+     * but slower; larger = faster but longer frame hitches. Default 64.
+     */
+    chunkSize?: number;
   },
 ): {
   store: EncryptedStore<TDefs, V>;
@@ -1025,6 +1075,7 @@ export function createCryptoStore<
           () => _currentEv,
           computedIndexes,
           defaultComputeConfig,
+          options?.chunkSize ?? DEFAULT_CRYPTO_CHUNK,
         ),
       ];
     }),
