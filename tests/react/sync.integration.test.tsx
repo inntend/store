@@ -70,12 +70,14 @@ function makeServerTable<T extends SyncableMeta>(
         rows = rows.filter((r) => r.updatedAt <= updatedAt.$lte!);
 
       const syncedAt = where.syncedAt as
-        | { $gte?: Date; $lte?: Date }
+        | { $gte?: Date; $gt?: Date; $lte?: Date; $lt?: Date }
         | undefined;
       if (syncedAt) {
         const t = (r: T) => r.syncedAt ?? r.updatedAt;
         if (syncedAt.$gte) rows = rows.filter((r) => t(r) >= syncedAt.$gte!);
+        if (syncedAt.$gt) rows = rows.filter((r) => t(r) > syncedAt.$gt!);
         if (syncedAt.$lte) rows = rows.filter((r) => t(r) <= syncedAt.$lte!);
+        if (syncedAt.$lt) rows = rows.filter((r) => t(r) < syncedAt.$lt!);
       }
 
       const idFilter = where.id as { $in?: string[] } | undefined;
@@ -560,6 +562,7 @@ describe('useSync — encrypted store integration demo', () => {
       ...serverNote1,
       title: 'Server Update',
       updatedAt: T3,
+      syncedAt: T3, // a real server re-stamps syncedAt on every accepted change
     });
     serverNotes._db.set('note-2', {
       id: 'note-2',
@@ -584,6 +587,7 @@ describe('useSync — encrypted store integration demo', () => {
       ...serverItem1,
       name: mockEncrypt('updated-item'),
       updatedAt: T3,
+      syncedAt: T3, // a real server re-stamps syncedAt on every accepted change
     });
 
     // ── Server state after T3 mutations (no sync yet) ─────────────────────────
@@ -1171,6 +1175,7 @@ describe('useSync — encrypted store integration demo', () => {
       ...serverNoteE,
       deleted: true,
       updatedAt: T3,
+      syncedAt: T3, // a real server re-stamps syncedAt on every accepted change
     });
 
     // Server state: note-E is deleted

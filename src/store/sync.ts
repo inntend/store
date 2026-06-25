@@ -165,7 +165,12 @@ export async function sync(
       const items = (delta[tableName] ?? []) as SyncableMeta[];
 
       const windowQuery = {
-        where: { syncedAt: { $gte: from, $lte: to } },
+        // Half-open on BOTH ends so a device never re-pulls its own pushes:
+        // accepted rows are stamped syncedAt=to, so `$lt: to` drops them from
+        // this sync, and `$gt: from` (from === the previous sync's `to`) drops
+        // them next sync. `syncedTo` stays `to`, so the client's push cursor
+        // (updatedAt >= from) is unaffected — no rows are missed on push.
+        where: { syncedAt: { $gt: from, $lt: to } },
         deleted: true as const,
         ...(pageSize != null
           ? {

@@ -68,12 +68,14 @@ function makeTable(
       }
 
       const syncedAt = where.syncedAt as
-        | { $gte?: Date; $lte?: Date }
+        | { $gte?: Date; $gt?: Date; $lte?: Date; $lt?: Date }
         | undefined;
       if (syncedAt) {
         const t = (r: Item) => r.syncedAt ?? r.updatedAt;
         if (syncedAt.$gte) rows = rows.filter((r) => t(r) >= syncedAt.$gte!);
+        if (syncedAt.$gt) rows = rows.filter((r) => t(r) > syncedAt.$gt!);
         if (syncedAt.$lte) rows = rows.filter((r) => t(r) <= syncedAt.$lte!);
+        if (syncedAt.$lt) rows = rows.filter((r) => t(r) < syncedAt.$lt!);
       }
 
       const idFilter = where.id as { $in?: string[] } | undefined;
@@ -131,11 +133,11 @@ const t4 = new Date('2024-01-01T04:00:00Z');
 
 describe('sync', () => {
   describe('empty delta (no incoming items)', () => {
-    it('returns all server records updatedAt in [from, to]', async () => {
+    it('returns server records with syncedAt in (from, to) — both bounds exclusive', async () => {
       const table = makeTable([
-        { id: 'a', updatedAt: t1, value: 'A' },
+        { id: 'a', updatedAt: t1, value: 'A' }, // at exactly `from` → excluded
         { id: 'b', updatedAt: t2, value: 'B' },
-        { id: 'c', updatedAt: t3, value: 'C' },
+        { id: 'c', updatedAt: t3, value: 'C' }, // at exactly `to`   → excluded
       ]);
 
       const { delta, hasMore } = await syncOne(table, {
@@ -144,8 +146,10 @@ describe('sync', () => {
         items: [],
       });
 
+      // Both bounds are exclusive so a device never re-pulls its own pushes,
+      // which are stamped at exactly `to` (this sync) / `from` (the previous one).
       const ids = delta.map((r) => r.id).sort();
-      expect(ids).toEqual(['a', 'b', 'c']);
+      expect(ids).toEqual(['b']);
       expect(hasMore).toBe(false);
     });
 
@@ -159,6 +163,29 @@ describe('sync', () => {
 
       expect(delta).toHaveLength(1);
       expect(delta[0]!.id).toBe('b');
+    });
+
+    it('does not echo a device its own just-pushed rows (no self re-pull)', async () => {
+      // Regression: pushed rows are stamped syncedAt=to. The pull window is
+      // (from, to) — exclusive on both ends — so they are dropped this sync AND
+      // next sync (next from === this to). A first sync from epoch must not page
+      // its own uploads straight back to itself.
+      const table = makeTable();
+
+      // Sync 1 — push one row from epoch.
+      const r1 = await syncOne(table, {
+        from: t0,
+        to: t2,
+        items: [{ id: 'mine', updatedAt: t1, value: 'X' }],
+        pageSize: 100,
+      });
+      expect(table._db.get('mine')).toBeDefined(); // stored on the server
+      expect(r1.delta.find((r) => r.id === 'mine')).toBeUndefined(); // not echoed
+      expect(r1.hasMore).toBe(false);
+
+      // Sync 2 — empty delta from the previous `to`; still must not pull it back.
+      const r2 = await syncOne(table, { from: t2, to: t3, items: [] });
+      expect(r2.delta.find((r) => r.id === 'mine')).toBeUndefined();
     });
 
     it('returns empty array when no records in window', async () => {
