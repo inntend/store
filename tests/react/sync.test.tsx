@@ -107,6 +107,30 @@ function mockSyncableStore(): SyncableStore {
   };
 }
 
+// Fake-timer preset that leaves setImmediate real so fake-indexeddb's internal
+// async operations (and therefore the hook's settings load) resolve normally.
+const FAKE_TIMERS: Parameters<typeof vi.useFakeTimers>[0] = {
+  toFake: [
+    'setTimeout',
+    'clearTimeout',
+    'setInterval',
+    'clearInterval',
+    'Date',
+  ],
+};
+
+// Drains the settings load + mount auto-sync without advancing fake time:
+// each round yields to the event loop via a REAL setImmediate, and act() is
+// exited between rounds so fake-indexeddb writes (blocked while act's queue
+// is processing) can commit.
+async function flushAsync(rounds = 20) {
+  for (let i = 0; i < rounds; i++) {
+    await act(async () => {
+      await new Promise((r) => setImmediate(r));
+    });
+  }
+}
+
 // ─── useSyncState ─────────────────────────────────────────────────────────────
 
 describe('useSyncState', () => {
@@ -159,8 +183,8 @@ describe('useSync — initial state', () => {
         }),
       { wrapper: makeWrapper(store) },
     );
-    // Auto-sync fires immediately on mount; drain it before checking state
-    await act(async () => {});
+    // Auto-sync fires on mount once settings have loaded; drain it fully
+    await flushAsync();
     expect(result.current.syncing).toBe(false);
     expect(result.current.lastSynced).toBeDefined();
     expect(result.current.syncState).toBe('online');
@@ -175,21 +199,27 @@ describe('useSync — settings', () => {
     store = makeStore();
   });
 
-  it('loads lastSynced from settings on mount', async () => {
+  it('loads lastSynced from settings before the first auto-sync', async () => {
     const iso = new Date('2024-06-01').toISOString();
     await store.settings.set('lastSynced', iso);
 
-    const { result } = renderHook(
+    const fetcher = vi.fn().mockResolvedValue({ data: {}, hasMore: false });
+    renderHook(
       () =>
         useSync({
           store: mockSyncableStore(),
-          fetcher: vi.fn().mockResolvedValue({ data: {}, hasMore: false }),
+          fetcher,
           defaultFrom: new Date(0),
         }),
       { wrapper: makeWrapper(store) },
     );
 
-    await waitFor(() => expect(result.current.lastSynced).toBe(iso));
+    // Regression guard: the mount auto-sync must wait for the persisted
+    // cursor — it must NOT sync from defaultFrom (a full re-pull) while a
+    // real lastSynced exists.
+    await waitFor(() => expect(fetcher).toHaveBeenCalled());
+    const { from } = fetcher.mock.calls[0]![0] as { from: Date };
+    expect(from.toISOString()).toBe(iso);
   });
 
   it('persists lastSynced to settings after sync', async () => {
@@ -234,6 +264,10 @@ describe('useSync — fetcher params', () => {
       { wrapper: makeWrapper(store) },
     );
 
+    // Drain the mount auto-sync so the manual call below is isolated
+    await flushAsync();
+    fetcher.mockClear();
+
     await act(async () => {
       await result.current.sync();
     });
@@ -252,7 +286,7 @@ describe('useSync — fetcher params', () => {
   });
 
   it('passes device current timestamp as `to`', async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers(FAKE_TIMERS);
     const fakeNow = new Date('2024-06-15T10:30:00Z');
     vi.setSystemTime(fakeNow);
 
@@ -297,7 +331,7 @@ describe('useSync — offline/disabled drops the call', () => {
       { wrapper: makeWrapper(store) },
     );
     // Drain initial auto-sync, then clear to isolate the disabled-guard behaviour
-    await act(async () => {});
+    await flushAsync();
     fetcher.mockClear();
     await act(async () => {
       result.current.setSyncState('disabled');
@@ -320,7 +354,7 @@ describe('useSync — offline/disabled drops the call', () => {
       { wrapper: makeWrapper(store) },
     );
     // Drain initial auto-sync, then clear to isolate the disabled-guard behaviour
-    await act(async () => {});
+    await flushAsync();
     fetcher.mockClear();
     await act(async () => {
       result.current.setSyncState('disabled');
@@ -354,18 +388,9 @@ describe('useSync — offline/disabled drops the call', () => {
 // ─── useSync — concurrent call guard ─────────────────────────────────────────
 
 describe('useSync — concurrent call guard', () => {
-  it('ignores a second sync() call while one is in flight', async () => {
+  it('coalesces concurrent sync() calls into at most one follow-up run', async () => {
     const store = makeStore();
-    let resolveFirst!: (v: unknown) => void;
-    const fetcher = vi
-      .fn()
-      .mockImplementationOnce(
-        () =>
-          new Promise((res) => {
-            resolveFirst = res;
-          }),
-      )
-      .mockResolvedValue({ data: {}, hasMore: false });
+    const fetcher = vi.fn().mockResolvedValue({ data: {}, hasMore: false });
 
     const { result } = renderHook(
       () =>
@@ -377,17 +402,38 @@ describe('useSync — concurrent call guard', () => {
       { wrapper: makeWrapper(store) },
     );
 
-    const firstPromise = result.current.sync();
+    // Drain the mount auto-sync so the calls below are isolated
+    await flushAsync();
+    fetcher.mockClear();
+
+    let resolveFirst!: (v: unknown) => void;
+    fetcher.mockImplementationOnce(
+      () =>
+        new Promise((res) => {
+          resolveFirst = res;
+        }),
+    );
+
+    let firstPromise!: Promise<void>;
+    let secondPromise!: Promise<void>;
+    let thirdPromise!: Promise<void>;
     await act(async () => {
-      await result.current.sync(); // dropped
+      firstPromise = result.current.sync(); // starts, hangs on fetcher
+      secondPromise = result.current.sync(); // in flight → queues follow-up
+      thirdPromise = result.current.sync(); // follow-up already queued → dropped
+      await Promise.all([secondPromise, thirdPromise]);
     });
 
+    // Only the first call has hit the network so far
+    expect(fetcher).toHaveBeenCalledTimes(1);
+
     await act(async () => {
-      resolveFirst({ data: {}, hasMore: false, syncedTo: new Date() });
+      resolveFirst({ data: {}, hasMore: false });
       await firstPromise;
     });
 
-    expect(fetcher).toHaveBeenCalledTimes(1);
+    // The queued calls collapse into exactly one follow-up run
+    await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(2));
   });
 });
 
@@ -444,19 +490,14 @@ describe('useSync — defaultFrom', () => {
     const defaultFrom = new Date('2000-01-01');
     const fetcher = vi.fn().mockResolvedValue({ data: {}, hasMore: false });
 
-    const { result } = renderHook(
+    renderHook(
       () => useSync({ store: mockSyncableStore(), fetcher, defaultFrom }),
       { wrapper: makeWrapper(store) },
     );
 
-    await waitFor(() => expect(result.current.lastSynced).toBe(iso));
-    // Clear auto-sync calls; the next call should use the settings-loaded iso value
-    fetcher.mockClear();
-
-    await act(async () => {
-      await result.current.sync();
-    });
-
+    // Every sync — including the very first on mount — must use the
+    // persisted cursor, never defaultFrom.
+    await waitFor(() => expect(fetcher).toHaveBeenCalled());
     const { from } = fetcher.mock.calls[0]![0] as { from: Date };
     expect(from.getTime()).toBe(new Date(iso).getTime());
   });
@@ -501,21 +542,25 @@ describe('useSync — encrypted context', () => {
     const iso = new Date('2025-01-01').toISOString();
     await rawStore.settings.set('lastSynced', iso);
 
-    const { result } = renderHook(
+    const fetcher = vi.fn().mockResolvedValue({ data: {}, hasMore: false });
+    renderHook(
       () =>
         useEncSync({
           store: mockEncStore(),
-          fetcher: vi.fn().mockResolvedValue({ data: {}, hasMore: false }),
+          fetcher,
           defaultFrom: new Date(0),
         }),
       { wrapper: encWrapper },
     );
 
-    await waitFor(() => expect(result.current.lastSynced).toBe(iso));
+    // The first sync must start from the persisted raw-store cursor.
+    await waitFor(() => expect(fetcher).toHaveBeenCalled());
+    const { from } = fetcher.mock.calls[0]![0] as { from: Date };
+    expect(from.toISOString()).toBe(iso);
   });
 
   it('passes device current timestamp as `to` in encrypted context', async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers(FAKE_TIMERS);
     const fakeNow = new Date('2024-07-20T14:45:00Z');
     vi.setSystemTime(fakeNow);
 
@@ -545,7 +590,7 @@ describe('useSync — encrypted context', () => {
 describe('useSync — offline detection', () => {
   let store: DexieStore<typeof defs>;
   beforeEach(() => {
-    vi.useFakeTimers();
+    vi.useFakeTimers(FAKE_TIMERS);
     store = makeStore();
   });
   afterEach(() => {
@@ -623,7 +668,7 @@ describe('useSync — offline detection', () => {
     );
 
     // Drain initial auto-sync (it fails → offline), then clear and disable
-    await act(async () => {});
+    await flushAsync();
     fetcher.mockClear();
 
     await act(async () => {
@@ -645,11 +690,14 @@ describe('useSync — offline detection', () => {
 describe('useSync — backoff', () => {
   let store: DexieStore<typeof defs>;
   beforeEach(() => {
-    vi.useFakeTimers();
+    vi.useFakeTimers(FAKE_TIMERS);
+    // Pin jitter to 1.0× (0.8 + 0.5·0.4) so backoff timings are exact.
+    vi.spyOn(Math, 'random').mockReturnValue(0.5);
     store = makeStore();
   });
   afterEach(() => {
     vi.useRealTimers();
+    vi.restoreAllMocks();
   });
 
   it('schedules first retry after BACKOFF_INITIAL_MS', async () => {
@@ -670,7 +718,7 @@ describe('useSync — backoff', () => {
     );
 
     // Auto-sync on mount triggers offline (first and only call so far)
-    await act(async () => {});
+    await flushAsync();
     expect(result.current.syncState).toBe('offline');
     expect(fetcher).toHaveBeenCalledTimes(1);
 
@@ -771,14 +819,17 @@ describe('useSync — backoff', () => {
 describe('useSync — auto-refresh', () => {
   let store: DexieStore<typeof defs>;
   beforeEach(() => {
-    vi.useFakeTimers();
+    vi.useFakeTimers(FAKE_TIMERS);
+    // Pin jitter so backoff-related timings stay exact.
+    vi.spyOn(Math, 'random').mockReturnValue(0.5);
     store = makeStore();
   });
   afterEach(() => {
     vi.useRealTimers();
+    vi.restoreAllMocks();
   });
 
-  it('auto-syncs on the configured interval when online', async () => {
+  it('auto-syncs on the configured interval when online (adaptive stretching pinned)', async () => {
     const fetcher = vi.fn().mockResolvedValue({ data: {}, hasMore: false });
     const refreshInterval = 10_000;
 
@@ -789,12 +840,15 @@ describe('useSync — auto-refresh', () => {
           fetcher,
           defaultFrom: new Date(0),
           refreshInterval,
+          // Cap the adaptive idle interval at the base interval so the
+          // cadence stays fixed for this test.
+          maxRefreshInterval: refreshInterval,
         }),
       { wrapper: makeWrapper(store) },
     );
 
-    // Auto-sync fires immediately on mount (1 call), then once per interval
-    await act(async () => {});
+    // Auto-sync fires on mount (1 call), then once per interval
+    await flushAsync();
     expect(fetcher).toHaveBeenCalledTimes(1);
 
     await act(async () => {
@@ -806,6 +860,58 @@ describe('useSync — auto-refresh', () => {
       await vi.advanceTimersByTimeAsync(refreshInterval);
     });
     expect(fetcher).toHaveBeenCalledTimes(3);
+  });
+
+  it('quiet syncs stretch the auto-sync delay up to maxRefreshInterval; activity resets it', async () => {
+    // Every sync here is "quiet": empty local delta, empty server response.
+    const fetcher = vi.fn().mockResolvedValue({ data: {}, hasMore: false });
+    const refreshInterval = 10_000;
+
+    const { result } = renderHook(
+      () =>
+        useSync({
+          store: mockSyncableStore(),
+          fetcher,
+          defaultFrom: new Date(0),
+          refreshInterval,
+          maxRefreshInterval: 40_000,
+        }),
+      { wrapper: makeWrapper(store) },
+    );
+
+    // Mount sync is quiet → next delay doubles to 20s.
+    await flushAsync();
+    expect(fetcher).toHaveBeenCalledTimes(1);
+
+    // Nothing at the base interval any more…
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(refreshInterval);
+    });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+
+    // …but the doubled delay fires (10s + 10s = 20s total).
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(refreshInterval);
+    });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+
+    // Next delay doubles again to 40s (the cap).
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(40_000);
+    });
+    expect(fetcher).toHaveBeenCalledTimes(3);
+
+    // A manual sync (user activity) snaps the delay back to the base interval.
+    await act(async () => {
+      await result.current.sync();
+    });
+    expect(fetcher).toHaveBeenCalledTimes(4);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(40_000);
+    });
+    // The pending 40s timer fires once, and the reset means subsequent syncs
+    // ran at the shorter cadence again — at least one more call happened.
+    expect(fetcher.mock.calls.length).toBeGreaterThanOrEqual(5);
   });
 
   it('refreshInterval: 0 disables auto-refresh', async () => {
@@ -823,7 +929,7 @@ describe('useSync — auto-refresh', () => {
     );
 
     // Drain the immediate auto-sync on mount, then verify no more calls fire
-    await act(async () => {});
+    await flushAsync();
     fetcher.mockClear();
 
     await act(async () => {
@@ -848,7 +954,7 @@ describe('useSync — auto-refresh', () => {
     );
 
     // Drain the immediate auto-sync, then clear before testing the disabled guard
-    await act(async () => {});
+    await flushAsync();
     fetcher.mockClear();
 
     await act(async () => {
@@ -880,7 +986,7 @@ describe('useSync — auto-refresh', () => {
     );
 
     // Auto-sync fires on mount, fails → goes offline (1 call)
-    await act(async () => {});
+    await flushAsync();
     expect(fetcher).toHaveBeenCalledTimes(1);
 
     // Backoff fires (BACKOFF_INITIAL_MS), not the refresh interval; retry succeeds →
@@ -904,6 +1010,10 @@ describe('useSync — auto-refresh', () => {
         }),
       { wrapper: makeWrapper(store) },
     );
+
+    // Drain the mount auto-sync so the manual call below is isolated
+    await flushAsync();
+    fetcher.mockClear();
 
     await act(async () => {
       await result.current.sync();
@@ -939,10 +1049,11 @@ describe('buildUseSync — checkAndFix called when records are written', () => {
       { wrapper: makeWrapper(store) },
     );
 
-    await act(async () => {});
+    await flushAsync();
     await act(async () => {
       await result.current.sync();
     });
+    await flushAsync();
 
     expect(checkAndFix).toHaveBeenCalledWith(
       expect.objectContaining({ users: ['u1'] }),
@@ -975,10 +1086,11 @@ describe('buildUseSync — checkAndFix called when records are written', () => {
       { wrapper: makeWrapper(store) },
     );
 
-    await act(async () => {});
+    await flushAsync();
     await act(async () => {
       await result.current.sync();
     });
+    await flushAsync();
 
     // checkAndFix threw but sync still succeeded
     expect(result.current.lastSynced).toBeDefined();

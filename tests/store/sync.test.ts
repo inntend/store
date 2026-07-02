@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import type { SyncClientParams } from '../../src/store/sync';
+import type { SyncCheckpoint, SyncClientParams } from '../../src/store/sync';
 import {
   ClockSkewError,
   conflictResolutionSchema,
@@ -637,7 +637,7 @@ describe('sync', () => {
           from: Date;
           to: Date;
           delta: Record<string, SyncableMeta[]>;
-          pageOffset: number;
+          pageOffset?: number;
         }): Promise<{
           data: Record<string, SyncableMeta[]>;
           hasMore: boolean;
@@ -1072,5 +1072,470 @@ describe('sync — clock skew', () => {
         { current: skewedCurrent, from: t0, to: t4, delta: {} },
       ),
     ).rejects.toBeInstanceOf(ClockSkewError);
+  });
+});
+
+// ─── sync — per-table paging mode ────────────────────────────────────────────
+
+describe('sync — per-table paging (pageOffsets)', () => {
+  it('empty pageOffsets pulls all tables from offset 0 and reports per-table next offsets', async () => {
+    const a = makeTable([
+      { id: 'a1', updatedAt: t1 },
+      { id: 'a2', updatedAt: t2 },
+      { id: 'a3', updatedAt: t3 },
+    ]);
+    const b = makeTable([{ id: 'b1', updatedAt: t1 }]);
+
+    const result = await sync(
+      { a, b },
+      { current: new Date(), from: t0, to: t4, delta: {}, pageOffsets: {} },
+      { pageSize: 2 },
+    );
+
+    expect(result.data.a).toHaveLength(2);
+    expect(result.data.b).toHaveLength(1);
+    expect(result.hasMore).toBe(true);
+    // Only table a has more rows — b is exhausted and gets no offset
+    expect(result.pageOffsets).toEqual({ a: 2 });
+  });
+
+  it('continuation pages only query the tables listed in pageOffsets', async () => {
+    const a = makeTable([
+      { id: 'a1', updatedAt: t1 },
+      { id: 'a2', updatedAt: t2 },
+      { id: 'a3', updatedAt: t3 },
+    ]);
+    const b = makeTable([{ id: 'b1', updatedAt: t1 }]);
+    const spyB = vi.spyOn(b, 'findMany');
+
+    const result = await sync(
+      { a, b },
+      {
+        current: new Date(),
+        from: t0,
+        to: t4,
+        delta: {},
+        pageOffsets: { a: 2 },
+      },
+      { pageSize: 2 },
+    );
+
+    expect(spyB).not.toHaveBeenCalled();
+    expect(result.data.a!.map((r) => r.id)).toEqual(['a3']);
+    expect(result.data.b).toBeUndefined();
+    expect(result.hasMore).toBe(false);
+    expect(result.pageOffsets).toEqual({});
+  });
+
+  it('fetches all records without duplicates across per-table pages', async () => {
+    const a = makeTable([
+      { id: 'a1', updatedAt: t1 },
+      { id: 'a2', updatedAt: t2 },
+      { id: 'a3', updatedAt: t3 },
+      { id: 'a4', updatedAt: t4 },
+    ]);
+
+    const seen: string[] = [];
+    let offsets: Record<string, number> = {};
+    for (let page = 0; page < 10; page++) {
+      const result = await sync(
+        { a },
+        {
+          current: new Date(),
+          from: t0,
+          to: new Date('2024-01-01T05:00:00Z'),
+          delta: {},
+          pageOffsets: offsets,
+        },
+        { pageSize: 3 },
+      );
+      seen.push(...result.data.a!.map((r) => r.id));
+      if (!result.hasMore) break;
+      offsets = result.pageOffsets!;
+    }
+
+    expect(seen.sort()).toEqual(['a1', 'a2', 'a3', 'a4']);
+  });
+});
+
+// ─── sync — maxPageBytes budget ──────────────────────────────────────────────
+
+describe('sync — maxPageBytes', () => {
+  const big = (id: string, updatedAt: Date): Item => ({
+    id,
+    updatedAt,
+    value: 'x'.repeat(1000),
+  });
+
+  it('truncates oversized pages and returns a resumable offset', async () => {
+    const a = makeTable([big('a1', t1), big('a2', t2), big('a3', t3)]);
+
+    const result = await sync(
+      { a },
+      { current: new Date(), from: t0, to: t4, delta: {}, pageOffsets: {} },
+      { pageSize: 10, maxPageBytes: 2500 },
+    );
+
+    // ~1KB per row, 2.5KB budget → 2 rows fit, third truncated
+    expect(result.data.a!.map((r) => r.id)).toEqual(['a1', 'a2']);
+    expect(result.hasMore).toBe(true);
+    expect(result.pageOffsets).toEqual({ a: 2 });
+
+    // Resume from the truncation point
+    const next = await sync(
+      { a },
+      {
+        current: new Date(),
+        from: t0,
+        to: t4,
+        delta: {},
+        pageOffsets: result.pageOffsets,
+      },
+      { pageSize: 10, maxPageBytes: 2500 },
+    );
+    expect(next.data.a!.map((r) => r.id)).toEqual(['a3']);
+    expect(next.hasMore).toBe(false);
+  });
+
+  it('always includes at least one row so pagination progresses', async () => {
+    const a = makeTable([big('a1', t1), big('a2', t2)]);
+
+    const result = await sync(
+      { a },
+      { current: new Date(), from: t0, to: t4, delta: {}, pageOffsets: {} },
+      { pageSize: 10, maxPageBytes: 10 },
+    );
+
+    expect(result.data.a).toHaveLength(1);
+    expect(result.pageOffsets).toEqual({ a: 1 });
+  });
+
+  it('never drops server-wins conflict rows under budget pressure', async () => {
+    const a = makeTable([
+      big('a1', t1),
+      big('a2', t2),
+      { id: 'conflict', updatedAt: t3, value: 'server' },
+    ]);
+
+    const result = await sync(
+      { a },
+      {
+        current: new Date(),
+        from: t0,
+        to: t4,
+        delta: { a: [{ id: 'conflict', updatedAt: t1, value: 'stale' }] },
+        pageOffsets: {},
+      },
+      { pageSize: 10, maxPageBytes: 10 },
+    );
+
+    const conflictRow = result.data.a!.find((r) => r.id === 'conflict');
+    expect(conflictRow).toBeDefined();
+    expect((conflictRow as Item).value).toBe('server');
+  });
+});
+
+// ─── sync — pushOnly ─────────────────────────────────────────────────────────
+
+describe('sync — pushOnly', () => {
+  it('applies the delta and returns only conflict rows, never the window', async () => {
+    const table = makeTable([
+      { id: 'window-row', updatedAt: t2, value: 'W' },
+      { id: 'newer-server', updatedAt: t3, value: 'server' },
+    ]);
+
+    const result = await sync(
+      { t: table },
+      {
+        current: new Date(),
+        from: t1,
+        to: t4,
+        delta: {
+          t: [
+            { id: 'fresh', updatedAt: t2, value: 'F' },
+            { id: 'newer-server', updatedAt: t2, value: 'stale' },
+          ],
+        },
+        pushOnly: true,
+      },
+      { pageSize: 100 },
+    );
+
+    // Delta applied
+    expect(table._db.get('fresh')!.value).toBe('F');
+    expect(table._db.get('newer-server')!.value).toBe('server');
+    // Response: only the server-wins row; window rows excluded
+    expect(result.data.t!.map((r) => r.id)).toEqual(['newer-server']);
+    expect(result.hasMore).toBe(false);
+  });
+
+  it('does not run the window query at all', async () => {
+    const table = makeTable([{ id: 'w', updatedAt: t2 }]);
+    const spy = vi.spyOn(table, 'findMany');
+
+    await sync(
+      { t: table },
+      {
+        current: new Date(),
+        from: t1,
+        to: t4,
+        delta: { t: [{ id: 'n', updatedAt: t2 }] },
+        pushOnly: true,
+      },
+      { pageSize: 100 },
+    );
+
+    // Exactly one findMany — the conflict-resolution lookup, not the window
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy.mock.calls[0]![0]).toMatchObject({
+      where: { id: { $in: ['n'] } },
+    });
+  });
+});
+
+// ─── syncClient — chunked push ───────────────────────────────────────────────
+
+describe('syncClient — chunked push', () => {
+  it('splits a large delta into pushOnly chunks followed by a pull', async () => {
+    const localRows: Item[] = Array.from({ length: 5 }, (_, i) => ({
+      id: `r${i}`,
+      updatedAt: t2,
+      value: `v${i}`,
+    }));
+    const local = makeTable(localRows);
+    const server = makeTable([]);
+
+    const calls: { pushOnly?: boolean; deltaCount: number }[] = [];
+    const fetcher = async (params: {
+      current: Date;
+      from: Date;
+      to: Date;
+      delta: Record<string, SyncableMeta[]>;
+      pageOffset?: number;
+      pageOffsets?: Record<string, number>;
+      pushOnly?: boolean;
+    }) => {
+      calls.push({
+        pushOnly: params.pushOnly,
+        deltaCount: Object.values(params.delta).reduce(
+          (n, rows) => n + rows.length,
+          0,
+        ),
+      });
+      return sync({ items: server }, { ...params, current: new Date() });
+    };
+
+    const { pushed } = await syncClient({ items: local }, t1, {
+      fetcher,
+      maxPushRecords: 2,
+    });
+
+    expect(pushed).toBe(5);
+    // 3 pushOnly chunks (2+2+1) then one pull request with an empty delta
+    expect(calls).toEqual([
+      { pushOnly: true, deltaCount: 2 },
+      { pushOnly: true, deltaCount: 2 },
+      { pushOnly: true, deltaCount: 1 },
+      { pushOnly: undefined, deltaCount: 0 },
+    ]);
+    // Server received every record exactly once
+    expect(server._db.size).toBe(5);
+  });
+
+  it('chunks by byte size as well as record count', async () => {
+    const localRows: Item[] = Array.from({ length: 4 }, (_, i) => ({
+      id: `r${i}`,
+      updatedAt: t2,
+      value: 'x'.repeat(1000),
+    }));
+    const local = makeTable(localRows);
+    const server = makeTable([]);
+
+    let pushCalls = 0;
+    const fetcher = async (params: {
+      current: Date;
+      from: Date;
+      to: Date;
+      delta: Record<string, SyncableMeta[]>;
+      pushOnly?: boolean;
+    }) => {
+      if (params.pushOnly) pushCalls++;
+      return sync({ items: server }, { ...params, current: new Date() });
+    };
+
+    await syncClient({ items: local }, t1, {
+      fetcher,
+      maxPushRecords: 100,
+      maxPushBytes: 2500, // ~1KB rows → 2 per chunk
+    });
+
+    expect(pushCalls).toBe(2);
+    expect(server._db.size).toBe(4);
+  });
+
+  it('writes server-wins rows returned by pushOnly chunks into the local store', async () => {
+    const local = makeTable([{ id: 'stale', updatedAt: t1, value: 'old' }]);
+    const server = makeTable([{ id: 'stale', updatedAt: t3, value: 'newer' }]);
+    // Force chunking with a single-record delta
+    const fetcher = async (params: unknown) =>
+      sync({ items: server }, { ...(params as object), current: new Date() });
+
+    const { written } = await syncClient({ items: local }, t0, {
+      fetcher,
+      maxPushRecords: 0, // any delta is "too large" → pushOnly path
+    });
+
+    expect(local._db.get('stale')!.value).toBe('newer');
+    expect(written.items).toContain('stale');
+  });
+});
+
+// ─── syncClient — per-table pagination + checkpoint/resume ───────────────────
+
+describe('syncClient — per-table pagination and resume', () => {
+  function makeServer(rows: Item[]) {
+    const server = makeTable(rows);
+    const fetcher = vi.fn(async (params: unknown) =>
+      sync(
+        { items: server },
+        { ...(params as object), current: new Date() },
+        {
+          pageSize: 2,
+        },
+      ),
+    );
+    return { server, fetcher };
+  }
+
+  it('follows server pageOffsets until the pull completes', async () => {
+    const rows: Item[] = Array.from({ length: 5 }, (_, i) => ({
+      id: `s${i}`,
+      updatedAt: new Date(t1.getTime() + i * 1000),
+      value: `V${i}`,
+    }));
+    const { fetcher } = makeServer(rows);
+    const local = makeTable([]);
+
+    const { written } = await syncClient({ items: local }, t0, { fetcher });
+
+    expect(local._db.size).toBe(5);
+    expect(written.items).toHaveLength(5);
+    // 3 requests: page 0 (2 rows), page 1 (2 rows), page 2 (1 row)
+    expect(fetcher).toHaveBeenCalledTimes(3);
+    // Continuation requests echo the server's per-table offsets
+    expect(fetcher.mock.calls[1]![0]).toMatchObject({
+      pageOffsets: { items: 2 },
+    });
+    expect(fetcher.mock.calls[2]![0]).toMatchObject({
+      pageOffsets: { items: 4 },
+    });
+  });
+
+  it('reports checkpoints per page and clears them on completion', async () => {
+    const rows: Item[] = Array.from({ length: 5 }, (_, i) => ({
+      id: `s${i}`,
+      updatedAt: new Date(t1.getTime() + i * 1000),
+    }));
+    const { fetcher } = makeServer(rows);
+    const local = makeTable([]);
+    const checkpoints: (SyncCheckpoint | null)[] = [];
+
+    await syncClient({ items: local }, t0, {
+      fetcher,
+      onCheckpoint: (cp) => {
+        checkpoints.push(cp);
+      },
+    });
+
+    expect(checkpoints).toHaveLength(3);
+    expect(checkpoints[0]).toMatchObject({ pageOffsets: { items: 2 } });
+    expect(checkpoints[1]).toMatchObject({ pageOffsets: { items: 4 } });
+    expect(checkpoints[2]).toBeNull();
+  });
+
+  it('resumes a failed pull from the checkpoint without re-pushing or restarting', async () => {
+    const rows: Item[] = Array.from({ length: 5 }, (_, i) => ({
+      id: `s${i}`,
+      updatedAt: new Date(t1.getTime() + i * 1000),
+    }));
+    const server = makeTable(rows);
+    const local = makeTable([{ id: 'mine', updatedAt: t1, value: 'M' }]);
+
+    let checkpoint: SyncCheckpoint | undefined;
+    // Fail the second request of the first attempt (first continuation page,
+    // after page 0 — which carries the delta — has been applied).
+    let calls = 0;
+    const fetcher = vi.fn(async (params: unknown) => {
+      calls++;
+      if (calls === 2) throw new Error('network error');
+      return sync(
+        { items: server },
+        { ...(params as object), current: new Date() },
+        { pageSize: 2 },
+      );
+    });
+
+    const attempt = syncClient({ items: local }, t0, {
+      fetcher,
+      onCheckpoint: (cp) => {
+        checkpoint = cp ?? undefined;
+      },
+    });
+    await expect(attempt).rejects.toThrow('network error');
+    expect(checkpoint).toBeDefined();
+    const callsBeforeResume = fetcher.mock.calls.length;
+
+    // Retry with the checkpoint: no delta push, pull continues mid-window.
+    const { written, syncedTo, pushed } = await syncClient(
+      { items: local },
+      t0,
+      {
+        fetcher,
+        checkpoint,
+        onCheckpoint: (cp) => {
+          checkpoint = cp ?? undefined;
+        },
+      },
+    );
+
+    // Resume requests: remaining pages only (2), not a full restart (3+push)
+    expect(fetcher.mock.calls.length - callsBeforeResume).toBe(2);
+    const resumeFirstCall = fetcher.mock.calls[callsBeforeResume]![0] as {
+      delta: Record<string, SyncableMeta[]>;
+      pageOffsets?: Record<string, number>;
+    };
+    expect(Object.keys(resumeFirstCall.delta)).toHaveLength(0);
+    expect(resumeFirstCall.pageOffsets).toEqual({ items: 2 });
+    // `pushed` reflects that nothing was re-uploaded
+    expect(pushed).toBe(0);
+    expect(syncedTo).toBeInstanceOf(Date);
+    // All five server rows landed locally across the two attempts
+    for (const r of rows) expect(local._db.has(r.id)).toBe(true);
+    // written includes rows applied by the FAILED attempt too (reconstructed
+    // from the frozen window) so post-sync revalidation misses nothing
+    expect(written.items).toEqual(
+      expect.arrayContaining(rows.map((r) => r.id)),
+    );
+    expect(checkpoint).toBeUndefined();
+  });
+
+  it('ignores a stale checkpoint whose from does not match', async () => {
+    const { fetcher } = makeServer([{ id: 's0', updatedAt: t2 }]);
+    const local = makeTable([]);
+
+    await syncClient({ items: local }, t1, {
+      fetcher,
+      checkpoint: {
+        from: t0.toISOString(), // stale — current from is t1
+        to: t3.toISOString(),
+        pageOffsets: { items: 4 },
+      },
+    });
+
+    // A fresh sync ran: first request carries the (empty) delta and offset 0
+    const first = fetcher.mock.calls[0]![0] as {
+      pageOffsets?: Record<string, number>;
+    };
+    expect(first.pageOffsets).toEqual({});
   });
 });
