@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import type { ConflictResolution } from './sync';
+import type { ConflictResolution, SyncCheckpoint } from './sync';
 import { defineTable, StoreTable, TableDef } from './table';
 
 // ─── Settings table ───────────────────────────────────────────────────────────
@@ -31,6 +31,7 @@ export const SETTINGS_KEYS = [
   'conflictResolution',
   'pull',
   'reencryptVersion',
+  'syncCheckpoint',
 ] as const;
 export type SettingsKey = (typeof SETTINGS_KEYS)[number];
 
@@ -88,6 +89,7 @@ export type DefaultSettingsValues = {
   conflictResolution: ConflictResolution;
   pull: PullSettingsStore;
   reencryptVersion: number;
+  syncCheckpoint: SyncCheckpoint;
 };
 
 /** Typed interface for reading and writing settings entries. */

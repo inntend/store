@@ -43,6 +43,12 @@ export type SyncResult = {
   hasMore: boolean;
   /** The page size used by the server. Client uses this to advance `pageOffset`. */
   pageSize?: number;
+  /**
+   * Per-table next offsets for tables with more rows (per-table paging mode).
+   * The client echoes this back verbatim to fetch the next page; an empty
+   * object means the pull is complete.
+   */
+  pageOffsets?: Record<string, number>;
 };
 
 /**

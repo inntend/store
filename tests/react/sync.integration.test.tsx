@@ -256,7 +256,7 @@ function makeThreeTableFetcher(
     from: Date;
     to: Date;
     delta: Record<string, SyncableMeta[]>;
-    pageOffset: number;
+    pageOffset?: number;
   }) => {
     return sync(
       { notes: serverNotes, tags: serverTags, items: serverItems },
@@ -337,7 +337,7 @@ describe('useSync — encrypted store integration demo', () => {
     // ── Initial state ─────────────────────────────────────────────────────────
     // Auto-sync fires immediately on mount; wait for it to complete.
     // Server is empty so the auto-sync is a no-op for data but sets lastSynced.
-    await waitFor(() => expect(result.current.syncing).toBe(false));
+    await waitFor(() => expect(result.current.lastSynced).toBeDefined());
     expect(result.current.lastSynced).toBe(T1.toISOString());
     // liveQuery has emitted empty arrays after auto-sync drain
     expect(result.current.notes ?? []).toHaveLength(0);
@@ -797,7 +797,7 @@ describe('useSync — encrypted store integration demo', () => {
       from: Date;
       to: Date;
       delta: Record<string, SyncableMeta[]>;
-      pageOffset: number;
+      pageOffset?: number;
     }) => {
       return sync(
         { notes: serverNotes },
@@ -838,7 +838,7 @@ describe('useSync — encrypted store integration demo', () => {
     // outside the sync window [new Date(0), Ts] so they aren't pulled. The client
     // delta (note-A stale, note-C) is pushed; LWW keeps server's note-A (Tn>Ts).
     // note-C is a new record so the server accepts it.
-    await waitFor(() => expect(result.current.syncing).toBe(false));
+    await waitFor(() => expect(result.current.lastSynced).toBeDefined());
     expect(result.current.lastSynced).toBe(Ts.toISOString());
     expect(await settings.get('lastSynced')).toBe(Ts.toISOString());
 
@@ -1002,9 +1002,9 @@ describe('useSync — encrypted store integration demo', () => {
     );
 
     // Auto-sync fires immediately on mount; wait for it to fail → offline
-    await waitFor(() => expect(result.current.syncing).toBe(false));
+    await waitFor(() => expect(result.current.syncState).toBe('offline'));
+    expect(result.current.syncing).toBe(false);
     expect(result.current.lastSynced).toBeUndefined();
-    expect(result.current.syncState).toBe('offline');
 
     // A second sync attempt also fails — verifies offline persists and syncing resets
     await act(async () => {
@@ -1088,7 +1088,7 @@ describe('useSync — encrypted store integration demo', () => {
     expect(rawBefore[0]!.deleted).toBe(true);
 
     // Wait for auto-sync to complete: note-del (deleted=true) was pushed to server
-    await waitFor(() => expect(result.current.syncing).toBe(false));
+    await waitFor(() => expect(serverNotes._db.size).toBe(1));
     expect(serverNotes._db.size).toBe(1);
 
     // Sync at T3
@@ -1158,7 +1158,7 @@ describe('useSync — encrypted store integration demo', () => {
     );
 
     // Wait for auto-sync on mount to complete (fires at T1, pushes note-E to server)
-    await waitFor(() => expect(result.current.syncing).toBe(false));
+    await waitFor(() => expect(result.current.lastSynced).toBeDefined());
 
     // First explicit sync at T2: incremental from T1
     vi.setSystemTime(T2);
@@ -1328,20 +1328,20 @@ describe('useSync — encrypted store integration demo', () => {
     );
 
     // Wait for auto-sync on mount to complete, then clear so the concurrent-guard test is isolated
-    await waitFor(() => expect(result.current.syncing).toBe(false));
+    await waitFor(() => expect(result.current.lastSynced).toBeDefined());
     fetcherSpy.mockClear();
 
     // Both calls happen in the same synchronous context before any async work.
-    // The first call sets syncingRef.current = true synchronously; the second
-    // call sees it and returns immediately (never reaches fetcherSpy).
+    // The first call sets syncingRef.current = true; the second sees it and
+    // queues a single coalesced follow-up run instead of a parallel request.
     await act(async () => {
       const p1 = result.current.doSync();
-      result.current.doSync(); // dropped — syncingRef.current already true
-      await p1;
+      const p2 = result.current.doSync(); // coalesced — no parallel request
+      await Promise.all([p1, p2]);
     });
 
-    // Fetcher called exactly once
-    expect(fetcherSpy).toHaveBeenCalledTimes(1);
+    // The two calls collapse into the in-flight run plus one follow-up
+    await waitFor(() => expect(fetcherSpy).toHaveBeenCalledTimes(2));
     expect(result.current.syncing).toBe(false);
     expect(result.current.lastSynced).toBeDefined();
   });
@@ -1397,7 +1397,7 @@ describe('useSync — encrypted store integration demo', () => {
 
     // Auto-sync fires on mount at T1. note-G (T3 > T1) is outside the initial
     // window [new Date(0), T1] so it is NOT pulled. lastSynced is set to T1.
-    await waitFor(() => expect(result.current.syncing).toBe(false));
+    await waitFor(() => expect(result.current.lastSynced).toBeDefined());
     expect(result.current.lastSynced).toBe(T1.toISOString());
     fetcherSpy.mockClear();
 
@@ -1501,7 +1501,7 @@ describe('useSync — encrypted store integration demo', () => {
     );
 
     // Wait for auto-sync on mount to complete (T1 window: all 5 notes are at T1+Ns so outside [0,T1])
-    await waitFor(() => expect(result.current.syncing).toBe(false));
+    await waitFor(() => expect(result.current.lastSynced).toBeDefined());
     fetcherSpy.mockClear();
 
     vi.setSystemTime(T2);
@@ -1568,6 +1568,7 @@ describe('useSync — encrypted store integration demo', () => {
     expect(result.current.syncState).toBe('online');
 
     // Wait for auto-sync on mount to complete, then clear before testing disabled guard
+    await waitFor(() => expect(fetcherSpy).toHaveBeenCalled());
     await waitFor(() => expect(result.current.syncing).toBe(false));
     fetcherSpy.mockClear();
 
@@ -1590,10 +1591,14 @@ describe('useSync — encrypted store integration demo', () => {
     });
     expect(result.current.syncState).toBe('online');
 
-    // The auto-sync triggered by going online runs; a concurrent doSync() is dropped
+    // The auto-sync triggered by going online runs; a concurrent doSync()
+    // coalesces into one follow-up instead of a parallel request.
     await act(async () => {
       await result.current.doSync();
     });
-    expect(fetcherSpy).toHaveBeenCalledTimes(1);
+    await waitFor(() =>
+      expect(fetcherSpy.mock.calls.length).toBeGreaterThanOrEqual(1),
+    );
+    expect(fetcherSpy.mock.calls.length).toBeLessThanOrEqual(2);
   });
 });

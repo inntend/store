@@ -250,6 +250,7 @@ describe('createSettingsDef', () => {
       'conflictResolution',
       'pull',
       'reencryptVersion',
+      'syncCheckpoint',
     ]);
   });
 });
